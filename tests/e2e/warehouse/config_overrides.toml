@@ -1,0 +1,24 @@
+[JobsDB]
+enableBackup = false
+
+[Processor]
+processSessions = false
+
+[Router]
+maxStatusUpdateWaitInS = 1
+useTestSink = true
+
+[BatchRouter]
+mainLoopSleepInS = 2
+noOfWorkers = 8
+jobQueryBatchSize = 100000
+uploadFreqInS = 2
+maxFailedCountForJob = 128
+
+[recovery]
+enabled = false
+
+[Warehouse]
+uploadFreqInS = 3
+mainLoopSleepInS = 1
+warehouseSyncFreqIgnore=true

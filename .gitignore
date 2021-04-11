@@ -48,3 +48,18 @@ Thumbs.db
 *.mov
 *.wmv
 
+.DS_Store
+rudder-server
+.env
+.vscode
+*.coverprofile
+runtime.log
+dist/*
+workspaceConfig.json
+**/node_modules
+imports/enterprise.go
+enterprise
+*.coverprofile
+junit*.xml
+**/profile.out
+.idea/*
