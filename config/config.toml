@@ -275,10 +275,10 @@ storagePath = "/tmp/recovery_data.json"
 # logger configuration
 [Logger]
 enableConsole=true
-enableFile=false
+enableFile=true
 consoleJsonFormat=false
 fileJsonFormat=false
-logFileLocation="/tmp/rudder_log.log"
+logFileLocation="/log/combined.outerr.log"
 logFileSize = 100 # in MB
 enableTimestamp=true
 enableFileNameInLog=true
