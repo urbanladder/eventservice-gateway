@@ -4,15 +4,7 @@ RUN apk add --update go git build-base
 RUN go get github.com/onsi/ginkgo/ginkgo
 
 ENV LC_ALL=C
-
 ARG deploy_env=staging
-
-ENV APP_ENV=staging
-ENV appName=eventservice-backend
-ENV DEPLOY_ENV=staging
-ENV etcdHost=stg-docker-secrets.urbanladder.com 
-ENV JOB_NAME=pm2
-ENV robotsurl=
 
 # Set necessary environmet variables needed for our image
 ENV GO111MODULE=on \
