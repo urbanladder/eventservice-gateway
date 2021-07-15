@@ -10,7 +10,7 @@ import (
 func loadConfig() {
 	config.Initialize()
 
-	sourceTransformerURL = strings.TrimSuffix(config.GetEnv("DEST_TRANSFORM_URL", "http://localhost:9090"), "/") + "/v0/sources"
+	sourceTransformerURL = strings.TrimSuffix(config.GetEnv("DEST_TRANSFORM_URL", "http://localhost:9090"), "/") + "/v1/sources"
 	// Number of incoming webhooks that are batched before calling source transformer
 	maxWebhookBatchSize = config.GetInt("Gateway.webhook.maxBatchSize", 32)
 	// Timeout after which batch is formed anyway with whatever webhooks are available

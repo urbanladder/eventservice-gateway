@@ -103,10 +103,10 @@ var (
 func loadConfig() {
 	rootLevel = levelMap[config.GetEnv("LOG_LEVEL", "INFO")]
 	enableConsole = config.GetBool("Logger.enableConsole", true)
-	enableFile = config.GetBool("Logger.enableFile", false)
+	enableFile = config.GetBool("Logger.enableFile", true)
 	consoleJsonFormat = config.GetBool("Logger.consoleJsonFormat", false)
 	fileJsonFormat = config.GetBool("Logger.fileJsonFormat", false)
-	logFileLocation = config.GetString("Logger.logFileLocation", "/tmp/rudder_log.log")
+	logFileLocation = config.GetString("Logger.logFileLocation", "/log/combined.outerr.log")
 	logFileSize = config.GetInt("Logger.logFileSize", 100)
 	enableTimestamp = config.GetBool("Logger.enableTimestamp", true)
 	enableFileNameInLog = config.GetBool("Logger.enableFileNameInLog", false)
