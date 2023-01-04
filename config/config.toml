@@ -127,15 +127,15 @@ archivalTimeInDays = 10
 archiverTickerTimeInMin = 1440
 
 [JobsDB.backup]
-enabled = true
+enabled = false
 
 [JobsDB.backup.gw]
-enabled=true
+enabled=false
 pathPrefix=""
 
 [JobsDB.backup.rt]
-enabled=true
-failedOnly=true
+enabled=false
+failedOnly=false
 
 [JobsDB.backup.batch_rt]
 enabled=false
@@ -302,7 +302,7 @@ enableDestinationFailuresMetric = true
 
 # runtime stats are collected using go runtime package and published to statsd
 [RuntimeStats]
-enabled=true
+enabled=false
 statsCollectionInterval=10
 enableCPUStats=true
 enableMemStats=true
