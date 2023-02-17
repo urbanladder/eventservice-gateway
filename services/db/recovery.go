@@ -3,7 +3,6 @@ package db
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"sort"
 	"time"
@@ -16,9 +15,8 @@ import (
 )
 
 const (
-	normalMode    = "normal"
-	degradedMode  = "degraded"
-	migrationMode = "migration"
+	normalMode   = "normal"
+	degradedMode = "degraded"
 )
 
 type RecoveryHandler interface {
@@ -27,37 +25,38 @@ type RecoveryHandler interface {
 	Handle()
 }
 
-var CurrentMode string = normalMode // default mode
+var (
+	CurrentMode = normalMode // default mode
+	storagePath string
+)
 
 // RecoveryDataT : DS to store the recovery process data
 type RecoveryDataT struct {
-	StartTimes                      []int64
-	ReadableStartTimes              []string
-	DegradedModeStartTimes          []int64
-	ReadableDegradedModeStartTimes  []string
-	MigrationModeStartTimes         []int64
-	ReadableMigrationModeStartTimes []string
-	Mode                            string
+	StartTimes                     []int64
+	ReadableStartTimes             []string
+	DegradedModeStartTimes         []int64
+	ReadableDegradedModeStartTimes []string
+	Mode                           string
 }
 
-var pkgLogger logger.LoggerI
+var pkgLogger logger.Logger
 
-func init() {
+func Init() {
+	config.RegisterStringConfigVariable("/tmp/recovery_data.json", &storagePath, false, "recovery.storagePath")
 	pkgLogger = logger.NewLogger().Child("db").Child("recovery")
 }
 
-func getRecoveryData() RecoveryDataT {
-	storagePath := config.GetString("recovery.storagePath", "/tmp/recovery_data.json")
-	data, err := ioutil.ReadFile(storagePath)
+func getRecoveryData() (RecoveryDataT, error) {
+	var recoveryData RecoveryDataT
+
+	data, err := os.ReadFile(storagePath)
 	if os.IsNotExist(err) {
 		defaultRecoveryJSON := "{\"mode\":\"" + normalMode + "\"}"
 		data = []byte(defaultRecoveryJSON)
-	} else {
-		if err != nil {
-			panic(err)
-		}
+	} else if err != nil {
+		return recoveryData, err
 	}
-	var recoveryData RecoveryDataT
+
 	err = json.Unmarshal(data, &recoveryData)
 	if err != nil {
 		pkgLogger.Errorf("Failed to Unmarshall %s. Error:  %v", storagePath, err)
@@ -66,19 +65,15 @@ func getRecoveryData() RecoveryDataT {
 		}
 		recoveryData = RecoveryDataT{Mode: normalMode}
 	}
-	return recoveryData
+	return recoveryData, nil
 }
 
-func saveRecoveryData(recoveryData RecoveryDataT) {
+func saveRecoveryData(recoveryData RecoveryDataT) error {
 	recoveryDataJSON, err := json.MarshalIndent(&recoveryData, "", " ")
 	if err != nil {
-		panic(err)
+		return err
 	}
-	storagePath := config.GetString("recovery.storagePath", "/tmp/recovery_data.json")
-	err = ioutil.WriteFile(storagePath, recoveryDataJSON, 0644)
-	if err != nil {
-		panic(err)
-	}
+	return os.WriteFile(storagePath, recoveryDataJSON, 0o644)
 }
 
 // IsNormalMode checks if the current mode is normal
@@ -86,31 +81,28 @@ func IsNormalMode() bool {
 	return CurrentMode == normalMode
 }
 
-/*
-CheckOccurences : check if this occurred numTimes times in numSecs seconds
-*/
-func CheckOccurences(occurences []int64, numTimes int, numSecs int) (occurred bool) {
-
-	sort.Slice(occurences, func(i, j int) bool {
-		return occurences[i] < occurences[j]
+// CheckOccurrences : check if this occurred numTimes times in numSecs seconds
+func CheckOccurrences(occurrences []int64, numTimes, numSecs int) (occurred bool) {
+	sort.Slice(occurrences, func(i, j int) bool {
+		return occurrences[i] < occurrences[j]
 	})
 
-	recentOccurences := 0
+	recentOccurrences := 0
 	checkPointTime := time.Now().Unix() - int64(numSecs)
 
-	for i := len(occurences) - 1; i >= 0; i-- {
-		if occurences[i] < checkPointTime {
+	for i := len(occurrences) - 1; i >= 0; i-- {
+		if occurrences[i] < checkPointTime {
 			break
 		}
-		recentOccurences++
+		recentOccurrences++
 	}
-	if recentOccurences >= numTimes {
+	if recentOccurrences >= numTimes {
 		occurred = true
 	}
 	return
 }
 
-func getForceRecoveryMode(forceNormal bool, forceDegraded bool) string {
+func getForceRecoveryMode(forceNormal, forceDegraded bool) string {
 	switch {
 	case forceNormal:
 		return normalMode
@@ -118,20 +110,6 @@ func getForceRecoveryMode(forceNormal bool, forceDegraded bool) string {
 		return degradedMode
 	}
 	return ""
-
-}
-
-func getNextMode(currentMode string) string {
-	switch currentMode {
-	case normalMode:
-		return degradedMode
-	case degradedMode:
-		return degradedMode
-	case migrationMode: //Staying in the migrationMode forever on repeated restarts.
-		return migrationMode
-	}
-
-	return degradedMode
 }
 
 func NewRecoveryHandler(recoveryData *RecoveryDataT) RecoveryHandler {
@@ -141,10 +119,8 @@ func NewRecoveryHandler(recoveryData *RecoveryDataT) RecoveryHandler {
 		recoveryHandler = &NormalModeHandler{recoveryData: recoveryData}
 	case degradedMode:
 		recoveryHandler = &DegradedModeHandler{recoveryData: recoveryData}
-	case migrationMode:
-		recoveryHandler = &MigrationModeHandler{recoveryData: recoveryData}
 	default:
-		//If the recovery mode is not one of the above modes, defaulting to degraded mode.
+		// If the recovery mode is not one of the above modes, defaulting to degraded mode.
 		pkgLogger.Info("DB Recovery: Invalid recovery mode. Defaulting to degraded mode.")
 		recoveryData.Mode = degradedMode
 		recoveryHandler = &DegradedModeHandler{recoveryData: recoveryData}
@@ -153,7 +129,7 @@ func NewRecoveryHandler(recoveryData *RecoveryDataT) RecoveryHandler {
 }
 
 func alertOps(mode string) {
-	instanceName := config.GetEnv("INSTANCE_ID", "")
+	instanceName := config.GetString("INSTANCE_ID", "")
 
 	alertManager, err := alert.New()
 	if err != nil {
@@ -165,7 +141,7 @@ func alertOps(mode string) {
 
 // sendRecoveryModeStat sends the recovery mode metric every 10 seconds
 func sendRecoveryModeStat(appType string) {
-	recoveryModeStat := stats.NewTaggedStat("recovery.mode_normal", stats.GaugeType, stats.Tags{
+	recoveryModeStat := stats.Default.NewTaggedStat("recovery.mode_normal", stats.GaugeType, stats.Tags{
 		"appType": appType,
 	})
 	for {
@@ -175,8 +151,6 @@ func sendRecoveryModeStat(appType string) {
 			recoveryModeStat.Gauge(1)
 		case degradedMode:
 			recoveryModeStat.Gauge(2)
-		case migrationMode:
-			recoveryModeStat.Gauge(4)
 		}
 	}
 }

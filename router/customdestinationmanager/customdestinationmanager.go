@@ -1,106 +1,137 @@
 package customdestinationmanager
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"sync"
+	"time"
 
+	"github.com/sony/gobreaker"
+
+	"github.com/rudderlabs/rudder-server/config"
 	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
 	"github.com/rudderlabs/rudder-server/rruntime"
 	"github.com/rudderlabs/rudder-server/services/kvstoremanager"
 	"github.com/rudderlabs/rudder-server/services/streammanager"
-	"github.com/rudderlabs/rudder-server/utils"
+	"github.com/rudderlabs/rudder-server/services/streammanager/common"
 	"github.com/rudderlabs/rudder-server/utils/logger"
 	"github.com/rudderlabs/rudder-server/utils/misc"
 )
 
 const (
-	STREAM = "stream"
-	KV     = "kv"
+	STREAM              = "stream"
+	KV                  = "kv"
+	CLIENT_EXPIRED_CODE = 721
 )
 
 var (
-	ObjectStreamDestinations []string
-	KVStoreDestinations      []string
-	Destinations             []string
-	customManagerMap         map[string]*CustomManagerT
-	pkgLogger                logger.LoggerI
+	ObjectStreamDestinations    []string
+	KVStoreDestinations         []string
+	Destinations                []string
+	pkgLogger                   logger.Logger
+	disableEgress               bool
+	skipBackendConfigSubscriber bool
 )
 
 // DestinationManager implements the method to send the events to custom destinations
 type DestinationManager interface {
-	SendData(jsonData json.RawMessage, sourceID string, destID string) (int, string)
+	SendData(jsonData json.RawMessage, destID string) (int, string)
+	BackendConfigInitialized() <-chan struct{}
 }
 
 // CustomManagerT handles this module
 type CustomManagerT struct {
-	destType             string
-	managerType          string
-	destinationsMap      map[string]*CustomDestination
-	destinationLockMap   map[string]*sync.RWMutex
-	latestConfig         map[string]backendconfig.DestinationT
-	configSubscriberLock sync.RWMutex
+	destType    string
+	managerType string
+
+	stateMu  sync.RWMutex // protecting all 4 maps below
+	config   map[string]backendconfig.DestinationT
+	breaker  map[string]*breakerHolder
+	clientMu map[string]*sync.RWMutex
+	client   map[string]*clientHolder
+
+	timeout                  time.Duration
+	breakerTimeout           time.Duration
+	backendConfigInitialized chan struct{}
 }
 
-//CustomDestination keeps the config of a destination and corresponding producer for a stream destination
-type CustomDestination struct {
-	Config interface{}
-	Client interface{}
+// clientHolder keeps the config of a destination and corresponding producer for a stream destination
+type clientHolder struct {
+	config map[string]interface{}
+	client interface{}
 }
 
-func init() {
+type breakerHolder struct {
+	config    map[string]interface{}
+	breaker   *gobreaker.CircuitBreaker
+	lastError error
+}
+
+func Init() {
 	loadConfig()
 	pkgLogger = logger.NewLogger().Child("router").Child("customdestinationmanager")
 }
 
 func loadConfig() {
-	ObjectStreamDestinations = []string{"KINESIS", "KAFKA", "AZURE_EVENT_HUB", "FIREHOSE", "EVENTBRIDGE", "GOOGLEPUBSUB", "CONFLUENT_CLOUD", "PERSONALIZE"}
+	ObjectStreamDestinations = []string{"KINESIS", "KAFKA", "AZURE_EVENT_HUB", "FIREHOSE", "EVENTBRIDGE", "GOOGLEPUBSUB", "CONFLUENT_CLOUD", "PERSONALIZE", "GOOGLESHEETS", "BQSTREAM", "LAMBDA"}
 	KVStoreDestinations = []string{"REDIS"}
 	Destinations = append(ObjectStreamDestinations, KVStoreDestinations...)
-	customManagerMap = make(map[string]*CustomManagerT)
+	config.RegisterBoolConfigVariable(false, &disableEgress, false, "disableEgress")
 }
 
 // newClient delegates the call to the appropriate manager
 func (customManager *CustomManagerT) newClient(destID string) error {
+	destination := customManager.config[destID]
+	destConfig := destination.Config
+	_, err := customManager.breaker[destID].breaker.Execute(func() (interface{}, error) {
+		var customDestination *clientHolder
+		var err error
 
-	destConfig := customManager.latestConfig[destID].Config
-	var customDestination *CustomDestination
-	var err error
-
-	switch customManager.managerType {
-	case STREAM:
-		var producer interface{}
-		producer, err = streammanager.NewProducer(destConfig, customManager.destType)
-		if err == nil {
-			customDestination = &CustomDestination{
-				Config: destConfig,
-				Client: producer,
+		switch customManager.managerType {
+		case STREAM:
+			var producer interface{}
+			producer, err = streammanager.NewProducer(&destination, common.Opts{
+				Timeout: customManager.timeout,
+			})
+			if err == nil {
+				customDestination = &clientHolder{
+					config: destConfig,
+					client: producer,
+				}
+				customManager.client[destID] = customDestination
 			}
-			customManager.destinationsMap[destID] = customDestination
+		case KV:
+			kvManager := kvstoremanager.New(customManager.destType, destConfig)
+			customDestination = &clientHolder{
+				config: destConfig,
+				client: kvManager,
+			}
+			customManager.client[destID] = customDestination
+		default:
+			return nil, fmt.Errorf("no provider configured for Custom Destination Manager")
 		}
-	case KV:
-		kvManager := kvstoremanager.New(customManager.destType, destConfig)
-		customDestination = &CustomDestination{
-			Config: destConfig,
-			Client: kvManager,
-		}
-		customManager.destinationsMap[destID] = customDestination
-	default:
-		return fmt.Errorf("No provider configured for Custom Destination Manager")
+		customManager.breaker[destID].lastError = err
+		return nil, err
+	})
+	if errors.Is(err, gobreaker.ErrOpenState) && customManager.breaker[destID].lastError != nil {
+		return fmt.Errorf("%s, last error: %w", err, customManager.breaker[destID].lastError)
 	}
 	return err
 }
 
-func (customManager *CustomManagerT) send(jsonData json.RawMessage, destType string, client interface{}, config interface{}) (int, string) {
+func (customManager *CustomManagerT) send(jsonData json.RawMessage, client interface{}, config map[string]interface{}) (int, string) {
 	var statusCode int
 	var respBody string
 	switch customManager.managerType {
 	case STREAM:
-		statusCode, _, respBody = streammanager.Produce(jsonData, destType, client, config)
+		// If client is not properly initialized then it won't reach here
+		streamProducer, _ := client.(common.StreamProducer)
+		statusCode, _, respBody = streamProducer.Produce(jsonData, config)
 	case KV:
 		kvManager, _ := client.(kvstoremanager.KVStoreManager)
-
 		key, fields := kvstoremanager.EventToKeyValue(jsonData)
 		err := kvManager.HMSet(key, fields)
 		statusCode = kvManager.StatusCode(err)
@@ -115,123 +146,219 @@ func (customManager *CustomManagerT) send(jsonData json.RawMessage, destType str
 }
 
 // SendData gets the producer from streamDestinationsMap and sends data
-func (customManager *CustomManagerT) SendData(jsonData json.RawMessage, sourceID string, destID string) (int, string) {
-
-	customManager.configSubscriberLock.RLock()
-	destLock, ok := customManager.destinationLockMap[destID]
-	customManager.configSubscriberLock.RUnlock()
-	if !ok {
-		panic(fmt.Sprintf("[CDM %s] Unexpected state: Lock missing for %s", customManager.destType, destID))
+func (customManager *CustomManagerT) SendData(jsonData json.RawMessage, destID string) (int, string) {
+	if disableEgress {
+		return 200, `200: outgoing disabled`
 	}
 
-	destLock.RLock()
-	customDestination, ok := customManager.destinationsMap[destID]
+	customManager.stateMu.RLock()
+	clientLock, ok := customManager.clientMu[destID]
+	customManager.stateMu.RUnlock()
+	if !ok {
+		return 500, fmt.Sprintf("[CDM %s] Unexpected state: Lock missing for %s. Config might not have been updated. Please wait for a min before sending events.", customManager.destType, destID)
+	}
+
+	clientLock.RLock()
+	customDestination, ok := customManager.client[destID]
 
 	if !ok {
-		destLock.RUnlock()
-		destLock.Lock()
-		err := customManager.newClient(destID)
-		destLock.Unlock()
-		if err != nil {
-			return 400, fmt.Sprintf("[CDM %s] Unable to create client for %s", customManager.destType, destID)
+		clientLock.RUnlock()
+		clientLock.Lock()
+		var err error
+		if _, ok := customManager.client[destID]; !ok {
+			err = customManager.newClient(destID)
 		}
-		destLock.RLock()
-		customDestination = customManager.destinationsMap[destID]
+		clientLock.Unlock()
+		if err != nil {
+			return 400, fmt.Sprintf("[CDM %s] Unable to create client for %s %s", customManager.destType, destID, err.Error())
+		}
+		clientLock.RLock()
+		customDestination = customManager.client[destID]
 	}
-	destLock.RUnlock()
+	clientLock.RUnlock()
 
-	respStatusCode, respBody := customManager.send(jsonData, customManager.destType, customDestination.Client, customDestination.Config)
+	respStatusCode, respBody := customManager.send(jsonData, customDestination.client, customDestination.config)
+
+	if respStatusCode == CLIENT_EXPIRED_CODE {
+		clientLock.Lock()
+		err := customManager.refreshClient(destID)
+		clientLock.Unlock()
+		if err != nil {
+			return 400, fmt.Sprintf("[CDM %s] Unable to refresh client for %s %s", customManager.destType, destID, err.Error())
+		}
+		clientLock.RLock()
+		customDestination = customManager.client[destID]
+		clientLock.RUnlock()
+		respStatusCode, respBody = customManager.send(jsonData, customDestination.client, customDestination.config)
+	}
+
 	return respStatusCode, respBody
 }
 
-func (customManager *CustomManagerT) close(destination backendconfig.DestinationT) {
-	destID := destination.ID
-	customDestination := customManager.destinationsMap[destID]
+func (customManager *CustomManagerT) close(destID string) {
+	customDestination := customManager.client[destID]
 	switch customManager.managerType {
 	case STREAM:
-		streammanager.CloseProducer(customDestination.Client, customManager.destType)
+		streamProducer, _ := customDestination.client.(common.StreamProducer)
+		_ = streamProducer.Close()
 	case KV:
-		kvManager, _ := customDestination.Client.(kvstoremanager.KVStoreManager)
-		kvManager.Close()
+		kvManager, _ := customDestination.client.(kvstoremanager.KVStoreManager)
+		_ = kvManager.Close()
 	}
-	delete(customManager.destinationsMap, destID)
+	delete(customManager.client, destID)
 }
 
-func (customManager *CustomManagerT) onConfigChange(destination backendconfig.DestinationT) error {
-	newDestConfig := destination.Config
-	customDestination, ok := customManager.destinationsMap[destination.ID]
+func (customManager *CustomManagerT) refreshClient(destID string) error {
+	customDestination, ok := customManager.client[destID]
 
 	if ok {
-		hasDestConfigChanged := !reflect.DeepEqual(customDestination.Config, newDestConfig)
+		pkgLogger.Infof("[CDM %s] [Token Expired] Closing Existing client for destination id: %s", customManager.destType, destID)
+		switch customManager.managerType {
+		case STREAM:
+			streamProducer, _ := customDestination.client.(common.StreamProducer)
+			streamProducer.Close()
+		case KV:
+			kvManager, _ := customDestination.client.(kvstoremanager.KVStoreManager)
+			_ = kvManager.Close()
+		}
+	}
+	err := customManager.newClient(destID)
+	if err != nil {
+		pkgLogger.Errorf("[CDM %s] [Token Expired] Error while creating new client for destination id: %s", customManager.destType, destID)
+		return err
+	}
+	pkgLogger.Infof("[CDM %s] [Token Expired] Created new client for destination id: %s", customManager.destType, destID)
+	return nil
+}
+
+func (customManager *CustomManagerT) onNewDestination(destination backendconfig.DestinationT) error { // skipcq: CRT-P0003
+	customManager.stateMu.Lock()
+	defer customManager.stateMu.Unlock()
+	var err error
+	clientLock, ok := customManager.clientMu[destination.ID]
+	if !ok {
+		clientLock = &sync.RWMutex{}
+		customManager.clientMu[destination.ID] = clientLock
+	}
+	clientLock.Lock()
+	defer clientLock.Unlock()
+	customManager.config[destination.ID] = destination
+	err = customManager.onConfigChange(destination.ID, destination.Config)
+	return err
+}
+
+func (customManager *CustomManagerT) onConfigChange(destID string, newDestConfig map[string]interface{}) error {
+	_, hasOpenClient := customManager.client[destID]
+	breaker, hasCircuitBreaker := customManager.breaker[destID]
+	if hasCircuitBreaker {
+		hasDestConfigChanged := !reflect.DeepEqual(
+			customManager.genComparisonConfig(breaker.config),
+			customManager.genComparisonConfig(newDestConfig),
+		)
 
 		if !hasDestConfigChanged {
 			return nil
 		}
-
-		pkgLogger.Infof("[CDM %s] Config changed. Closing Existing client for destination: %s", customManager.destType, destination.Name)
-		customManager.close(destination)
+		if hasOpenClient {
+			pkgLogger.Infof("[CDM %s] Config changed. Closing Existing client for destination: %s", customManager.destType, destID)
+			customManager.close(destID)
+		}
 	}
-
-	if err := customManager.newClient(destination.ID); err != nil {
-		pkgLogger.Errorf("[CDM %s] DestID: %s, Error while creating new customer client: %v", customManager.destType, destination.ID, err)
+	customManager.breaker[destID] = &breakerHolder{
+		config: newDestConfig,
+		breaker: gobreaker.NewCircuitBreaker(gobreaker.Settings{
+			Name:    destID,
+			Timeout: customManager.breakerTimeout,
+		}),
+	}
+	if err := customManager.newClient(destID); err != nil {
+		pkgLogger.Errorf("[CDM %s] DestID: %s, Error while creating new customer client: %v", customManager.destType, destID, err)
 		return err
 	}
-	pkgLogger.Infof("[CDM %s] DestID: %s, Created new client", customManager.destType, destination.ID)
+	pkgLogger.Infof("[CDM %s] DestID: %s, Created new client", customManager.destType, destID)
 	return nil
 }
 
+type Opts struct {
+	Timeout time.Duration
+}
+
 // New returns CustomdestinationManager
-func New(destType string) DestinationManager {
-	if misc.ContainsString(Destinations, destType) {
+func New(destType string, o Opts) DestinationManager {
+	if misc.Contains(Destinations, destType) {
 
 		managerType := STREAM
-		if misc.ContainsString(KVStoreDestinations, destType) {
+		if misc.Contains(KVStoreDestinations, destType) {
 			managerType = KV
 		}
 
-		customManager, ok := customManagerMap[destType]
-		if ok {
-			return customManager
+		customManager := &CustomManagerT{
+			timeout:                  o.Timeout,
+			destType:                 destType,
+			managerType:              managerType,
+			client:                   make(map[string]*clientHolder),
+			clientMu:                 make(map[string]*sync.RWMutex),
+			config:                   make(map[string]backendconfig.DestinationT),
+			breaker:                  make(map[string]*breakerHolder),
+			backendConfigInitialized: make(chan struct{}),
 		}
 
-		customManager = &CustomManagerT{
-			destType:           destType,
-			managerType:        managerType,
-			destinationsMap:    make(map[string]*CustomDestination),
-			destinationLockMap: make(map[string]*sync.RWMutex),
-			latestConfig:       make(map[string]backendconfig.DestinationT),
+		if !skipBackendConfigSubscriber {
+			rruntime.Go(func() {
+				customManager.backendConfigSubscriber()
+			})
+		} else {
+			close(customManager.backendConfigInitialized)
 		}
-		rruntime.Go(func() {
-			customManager.backendConfigSubscriber()
-		})
+
 		return customManager
 	}
 
 	return nil
 }
 
+func (customManager *CustomManagerT) BackendConfigInitialized() <-chan struct{} {
+	return customManager.backendConfigInitialized
+}
+
 func (customManager *CustomManagerT) backendConfigSubscriber() {
-	ch := make(chan utils.DataEvent)
-	backendconfig.Subscribe(ch, "backendConfig")
-	for {
-		config := <-ch
-		customManager.configSubscriberLock.Lock()
-		allSources := config.Data.(backendconfig.ConfigT)
-		for _, source := range allSources.Sources {
-			for _, destination := range source.Destinations {
-				if destination.DestinationDefinition.Name == customManager.destType {
-					destLock, ok := customManager.destinationLockMap[destination.ID]
-					if !ok {
-						destLock = &sync.RWMutex{}
-						customManager.destinationLockMap[destination.ID] = destLock
+	var once sync.Once
+	ch := backendconfig.DefaultBackendConfig.Subscribe(context.TODO(), "backendConfig")
+	for data := range ch {
+		config := data.Data.(map[string]backendconfig.ConfigT)
+		for _, wConfig := range config {
+			for _, source := range wConfig.Sources {
+				for _, destination := range source.Destinations {
+					if destination.DestinationDefinition.Name == customManager.destType {
+						err := customManager.onNewDestination(destination)
+						if err != nil {
+							pkgLogger.Errorf(
+								"[CDM %s] Error while subscribing to BackendConfig for destination id: %s",
+								customManager.destType, destination.ID,
+							)
+						}
 					}
-					destLock.Lock()
-					customManager.latestConfig[destination.ID] = destination
-					_ = customManager.onConfigChange(destination)
-					destLock.Unlock()
 				}
 			}
 		}
-		customManager.configSubscriberLock.Unlock()
+		once.Do(func() {
+			close(customManager.backendConfigInitialized)
+		})
 	}
+}
+
+func (customManager *CustomManagerT) genComparisonConfig(config interface{}) map[string]interface{} {
+	relevantConfigs := make(map[string]interface{})
+	configMap, ok := config.(map[string]interface{})
+	if !ok {
+		pkgLogger.Errorf("[CDM] DestType: %s. Destination config is not of expected type (map). Returning empty map", customManager.destType)
+		return map[string]interface{}{}
+	}
+
+	for k, v := range configMap {
+		if k != "eventDeliveryTS" && k != "eventDelivery" {
+			relevantConfigs[k] = v
+		}
+	}
+	return relevantConfigs
 }

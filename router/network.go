@@ -1,45 +1,81 @@
+//go:generate mockgen -destination=../mocks/router/mock_network.go -package mock_network github.com/rudderlabs/rudder-server/router NetHandleI
+
 package router
 
 import (
-	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"mime"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/rudderlabs/rudder-server/processor/integrations"
+	"github.com/rudderlabs/rudder-server/router/utils"
+	"github.com/rudderlabs/rudder-server/utils/httputil"
 	"github.com/rudderlabs/rudder-server/utils/logger"
 	"github.com/rudderlabs/rudder-server/utils/misc"
+	"github.com/rudderlabs/rudder-server/utils/sysUtils"
 )
 
-//NetHandleT is the wrapper holding private variables
-type NetHandleT struct {
-	httpClient *http.Client
-	logger     logger.LoggerI
+var contentTypeRegex *regexp.Regexp
+
+func init() {
+	contentTypeRegex = regexp.MustCompile(`^(text/[a-z0-9.-]+)|(application/([a-z0-9.-]+\+)?(json|xml))$`)
 }
 
-//var pkgLogger logger.LoggerI
+// NetHandleT is the wrapper holding private variables
+type NetHandleT struct {
+	httpClient sysUtils.HTTPClientI
+	logger     logger.Logger
+}
 
-//sendPost takes the EventPayload of a transformed job, gets the necessary values from the payload and makes a call to destination to push the event to it
-//this returns the statusCode, status and response body from the response of the destination call
-func (network *NetHandleT) sendPost(jsonData []byte) (statusCode int, respBody string) {
-	client := network.httpClient
-	//Parse the response to get parameters
-	postInfo, err := integrations.GetPostInfo(jsonData)
-	if err != nil {
-		return 400, fmt.Sprintf(`400 GetPostInfoFailed with error: %s`, err.Error())
+// Network interface
+type NetHandleI interface {
+	SendPost(ctx context.Context, structData integrations.PostParametersT) *utils.SendPostResponse
+}
+
+// temp solution for handling complex query params
+func handleQueryParam(param interface{}) string {
+	switch p := param.(type) {
+	case string:
+		return p
+	case map[string]interface{}:
+		temp, err := json.Marshal(p)
+		if err != nil {
+			return fmt.Sprint(p)
+		}
+
+		jsonParam := string(temp)
+		return jsonParam
+	default:
+		return fmt.Sprint(param)
 	}
+}
+
+// SendPost takes the EventPayload of a transformed job, gets the necessary values from the payload and makes a call to destination to push the event to it
+// this returns the statusCode, status and response body from the response of the destination call
+func (network *NetHandleT) SendPost(ctx context.Context, structData integrations.PostParametersT) *utils.SendPostResponse {
+	if disableEgress {
+		return &utils.SendPostResponse{
+			StatusCode:   200,
+			ResponseBody: []byte("200: outgoing disabled"),
+		}
+	}
+	client := network.httpClient
+	postInfo := structData
 	isRest := postInfo.Type == "REST"
 
 	isMultipart := len(postInfo.Files) > 0
 
 	// going forward we may want to support GraphQL and multipart requests
-	// the files key in the response is specifically to handle the multipart usecase
-	// for type GraphQL may need to support more keys like expected response format etc
+	// the files key in the response is specifically to handle the multipart use case
+	// for type GraphQL may need to support more keys like expected response format etc.
 	// in future it's expected that we will build on top of this response type
 	// so, code addition should be done here instead of version bumping of response.
 	if isRest && !isMultipart {
@@ -54,30 +90,9 @@ func (network *NetHandleT) sendPost(jsonData []byte) (statusCode int, respBody s
 				bodyValue = v.(map[string]interface{})
 				break
 			}
-
 		}
 
-		req, err := http.NewRequest(requestMethod, postInfo.URL, nil)
-		if err != nil {
-			network.logger.Error(fmt.Sprintf(`400 Unable to construct "%s" request for URL : "%s"`, requestMethod, postInfo.URL))
-			return 400, fmt.Sprintf(`400 Unable to construct "%s" request for URL : "%s"`, requestMethod, postInfo.URL)
-		}
-
-		// add queryparams to the url
-		// support of array type in params is handled if the
-		// response from transformers are "," seperated
-		queryParams := req.URL.Query()
-		for key, val := range requestQueryParams {
-			valString := fmt.Sprint(val)
-			// list := strings.Split(valString, ",")
-			// for _, listItem := range list {
-			// 	queryParams.Add(key, fmt.Sprint(listItem))
-			// }
-			queryParams.Add(key, fmt.Sprint(valString))
-		}
-
-		req.URL.RawQuery = queryParams.Encode()
-
+		var payload io.Reader
 		// support for JSON and FORM body type
 		if len(bodyValue) > 0 {
 			switch bodyFormat {
@@ -86,21 +101,59 @@ func (network *NetHandleT) sendPost(jsonData []byte) (statusCode int, respBody s
 				if err != nil {
 					panic(err)
 				}
-				req.Body = ioutil.NopCloser(bytes.NewReader(jsonValue))
-
+				payload = strings.NewReader(string(jsonValue))
+			case "JSON_ARRAY":
+				// support for JSON ARRAY
+				jsonListStr, ok := bodyValue["batch"].(string)
+				if !ok {
+					return &utils.SendPostResponse{
+						StatusCode:   400,
+						ResponseBody: []byte("400 Unable to parse json list. Unexpected transformer response"),
+					}
+				}
+				payload = strings.NewReader(jsonListStr)
+			case "XML":
+				strValue, ok := bodyValue["payload"].(string)
+				if !ok {
+					return &utils.SendPostResponse{
+						StatusCode:   400,
+						ResponseBody: []byte("400 Unable to construct xml payload. Unexpected transformer response"),
+					}
+				}
+				payload = strings.NewReader(strValue)
 			case "FORM":
 				formValues := url.Values{}
 				for key, val := range bodyValue {
 					formValues.Set(key, fmt.Sprint(val)) // transformer ensures top level string values, still val.(string) would be restrictive
 				}
-				req.Body = ioutil.NopCloser(strings.NewReader(formValues.Encode()))
-
+				payload = strings.NewReader(formValues.Encode())
 			default:
 				panic(fmt.Errorf("bodyFormat: %s is not supported", bodyFormat))
-
 			}
 		}
 
+		req, err := http.NewRequestWithContext(ctx, requestMethod, postInfo.URL, payload)
+		if err != nil {
+			network.logger.Error(fmt.Sprintf(`400 Unable to construct "%s" request for URL : "%s"`, requestMethod, postInfo.URL))
+			return &utils.SendPostResponse{
+				StatusCode:   400,
+				ResponseBody: []byte(fmt.Sprintf(`400 Unable to construct "%s" request for URL : "%s"`, requestMethod, postInfo.URL)),
+			}
+		}
+
+		// add query params to the url
+		// support of array type in params is handled if the
+		// response from transformers are "," separated
+		queryParams := req.URL.Query()
+		for key, val := range requestQueryParams { // list := strings.Split(valString, ",")
+			// for _, listItem := range list {
+			// 	queryParams.Add(key, fmt.Sprint(listItem))
+			// }
+			formattedVal := handleQueryParam(val)
+			queryParams.Add(key, formattedVal)
+		}
+
+		req.URL.RawQuery = queryParams.Encode()
 		headerKV := postInfo.Headers
 		for key, val := range headerKV {
 			req.Header.Add(key, val.(string))
@@ -109,44 +162,70 @@ func (network *NetHandleT) sendPost(jsonData []byte) (statusCode int, respBody s
 		req.Header.Add("User-Agent", "RudderLabs")
 
 		resp, err := client.Do(req)
-
-		var respBody []byte
-
-		if resp != nil && resp.Body != nil {
-			respBody, _ = ioutil.ReadAll(resp.Body)
-			network.logger.Debug(postInfo.URL, " : ", req.Proto, " : ", resp.Proto, resp.ProtoMajor, resp.ProtoMinor, resp.ProtoAtLeast)
-			defer resp.Body.Close()
-		}
-
 		if err != nil {
-			network.logger.Error("Errored when sending request to the server", err)
-			return http.StatusGatewayTimeout, string(respBody)
+			return &utils.SendPostResponse{
+				StatusCode:   http.StatusGatewayTimeout,
+				ResponseBody: []byte(fmt.Sprintf(`504 Unable to make "%s" request for URL : "%s". Error: %s`, requestMethod, postInfo.URL, err.Error())),
+			}
 		}
 
-		return resp.StatusCode, string(respBody)
+		defer func() { httputil.CloseResponse(resp) }()
 
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return &utils.SendPostResponse{
+				StatusCode:   resp.StatusCode,
+				ResponseBody: []byte(fmt.Sprintf(`Failed to read response body for request for URL : "%s". Error: %s`, postInfo.URL, err.Error())),
+			}
+		}
+		network.logger.Debug(postInfo.URL, " : ", req.Proto, " : ", resp.Proto, resp.ProtoMajor, resp.ProtoMinor, resp.ProtoAtLeast)
+
+		var contentTypeHeader string
+		if resp.Header != nil {
+			contentTypeHeader = resp.Header.Get("Content-Type")
+		}
+		if contentTypeHeader == "" {
+			// Detecting content type of the respBody
+			contentTypeHeader = http.DetectContentType(respBody)
+		}
+		mediaType, _, _ := mime.ParseMediaType(contentTypeHeader)
+
+		// If media type is not in some human-readable format (text,json,xml), override the response with an empty string
+		// https://www.iana.org/assignments/media-types/media-types.xhtml
+		isHumanReadable := contentTypeRegex.MatchString(mediaType)
+		if !isHumanReadable {
+			respBody = []byte("redacted due to unsupported content-type")
+		}
+
+		return &utils.SendPostResponse{
+			StatusCode:          resp.StatusCode,
+			ResponseBody:        respBody,
+			ResponseContentType: contentTypeHeader,
+		}
 	}
 
 	// returning 200 with a message in case of unsupported processing
 	// so that we don't process again. can change this code to anything
 	// to be not picked up by router again
-	return 200, ""
-
+	return &utils.SendPostResponse{
+		StatusCode:   200,
+		ResponseBody: []byte{},
+	}
 }
 
-//Setup initializes the module
+// Setup initializes the module
 func (network *NetHandleT) Setup(destID string, netClientTimeout time.Duration) {
 	network.logger.Info("Network Handler Startup")
-	//Reference http://tleyden.github.io/blog/2016/11/21/tuning-the-go-http-client-library-for-load-testing
+	// Reference http://tleyden.github.io/blog/2016/11/21/tuning-the-go-http-client-library-for-load-testing
 	defaultRoundTripper := http.DefaultTransport
 	defaultTransportPointer, ok := defaultRoundTripper.(*http.Transport)
 	if !ok {
-		panic(fmt.Errorf("typecast of defaultRoundTripper to *http.Transport failed")) //TODO: Handle error
+		panic(fmt.Errorf("typecast of defaultRoundTripper to *http.Transport failed")) // TODO: Handle error
 	}
 	var defaultTransportCopy http.Transport
-	//Not safe to copy DefaultTransport
-	//https://groups.google.com/forum/#!topic/golang-nuts/JmpHoAd76aU
-	//Solved in go1.8 https://github.com/golang/go/issues/26013
+	// Not safe to copy DefaultTransport
+	// https://groups.google.com/forum/#!topic/golang-nuts/JmpHoAd76aU
+	// Solved in go1.8 https://github.com/golang/go/issues/26013
 	misc.Copy(&defaultTransportCopy, defaultTransportPointer)
 	network.logger.Info("forceHTTP1: ", getRouterConfigBool("forceHTTP1", destID, false))
 	if getRouterConfigBool("forceHTTP1", destID, false) {

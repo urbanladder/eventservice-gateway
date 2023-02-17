@@ -1,175 +1,139 @@
 package apphandlers
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"net/http"
-	"runtime"
-	"sync"
 	"time"
 
 	"github.com/rudderlabs/rudder-server/app"
+	"github.com/rudderlabs/rudder-server/app/cluster"
+	"github.com/rudderlabs/rudder-server/app/cluster/state"
 	"github.com/rudderlabs/rudder-server/config"
-	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
 	"github.com/rudderlabs/rudder-server/jobsdb"
 	"github.com/rudderlabs/rudder-server/processor"
 	"github.com/rudderlabs/rudder-server/router"
-	"github.com/rudderlabs/rudder-server/router/batchrouter"
 	"github.com/rudderlabs/rudder-server/services/diagnostics"
+	"github.com/rudderlabs/rudder-server/services/rsources"
 	"github.com/rudderlabs/rudder-server/services/validators"
-	"github.com/rudderlabs/rudder-server/utils"
 	"github.com/rudderlabs/rudder-server/utils/logger"
 	"github.com/rudderlabs/rudder-server/utils/misc"
+	"github.com/rudderlabs/rudder-server/utils/types/deployment"
+	"github.com/rudderlabs/rudder-server/utils/types/servermode"
 )
 
-var (
-	maxProcess                                                 int
-	gwDBRetention, routerDBRetention                           time.Duration
-	enableProcessor, enableRouter                              bool
-	objectStorageDestinations                                  []string
-	warehouseDestinations                                      []string
-	moduleLoadLock                                             sync.Mutex
-	routerLoaded                                               bool
-	processorLoaded                                            bool
-	pkgLogger                                                  logger.LoggerI
-	Diagnostics                                                diagnostics.DiagnosticsI = diagnostics.Diagnostics
-	readonlyGatewayDB, readonlyRouterDB, readonlyBatchRouterDB jobsdb.ReadonlyHandleT
-	readonlyProcErrorDB                                        jobsdb.ReadonlyHandleT
-)
-
-//AppHandler to be implemented by different app type objects.
+// AppHandler starts the app
 type AppHandler interface {
-	GetAppType() string
-	HandleRecovery(*app.Options)
-	StartRudderCore(*app.Options)
+	// Setup to be called only once before starting the app.
+	Setup(*app.Options) error
+	// Start starts the app
+	StartRudderCore(context.Context, *app.Options) error
 }
 
-func GetAppHandler(application app.Interface, appType string, versionHandler func(w http.ResponseWriter, r *http.Request)) AppHandler {
-	var handler AppHandler
+func GetAppHandler(application app.App, appType string, versionHandler func(w http.ResponseWriter, r *http.Request)) (AppHandler, error) {
+	log := logger.NewLogger().Child("apphandlers").Child(appType)
 	switch appType {
 	case app.GATEWAY:
-		handler = &GatewayApp{App: application, VersionHandler: versionHandler}
+		return &gatewayApp{app: application, versionHandler: versionHandler, log: log}, nil
 	case app.PROCESSOR:
-		handler = &ProcessorApp{App: application, VersionHandler: versionHandler}
+		return &processorApp{app: application, versionHandler: versionHandler, log: log}, nil
 	case app.EMBEDDED:
-		handler = &EmbeddedApp{App: application, VersionHandler: versionHandler}
+		return &embeddedApp{app: application, versionHandler: versionHandler, log: log}, nil
 	default:
-		panic(errors.New("invalid app type"))
+		return nil, fmt.Errorf("unsupported app type %s", appType)
 	}
-
-	return handler
 }
 
-func init() {
-	loadConfig()
-	pkgLogger = logger.NewLogger().Child("apphandlers")
+func rudderCoreDBValidator() error {
+	return validators.ValidateEnv()
 }
 
-func loadConfig() {
-	maxProcess = config.GetInt("maxProcess", 12)
-	gwDBRetention = config.GetDuration("gwDBRetentionInHr", 0) * time.Hour
-	routerDBRetention = config.GetDuration("routerDBRetention", 0)
-	enableProcessor = config.GetBool("enableProcessor", true)
-	enableRouter = config.GetBool("enableRouter", true)
-	objectStorageDestinations = []string{"S3", "GCS", "AZURE_BLOB", "MINIO", "DIGITAL_OCEAN_SPACES"}
-	warehouseDestinations = []string{"RS", "BQ", "SNOWFLAKE", "POSTGRES", "CLICKHOUSE"}
+func rudderCoreNodeSetup() error {
+	return validators.InitializeNodeMigrations()
 }
 
-func rudderCoreBaseSetup() {
+func rudderCoreWorkSpaceTableSetup() error {
+	return validators.CheckAndValidateWorkspaceToken()
+}
 
-	if !validators.ValidateEnv() {
-		panic(errors.New("Failed to start rudder-server"))
-	}
-	validators.InitializeEnv()
-
-	// Check if there is a probable inconsistent state of Data
+func setupReadonlyDBs() (gw *jobsdb.ReadonlyHandleT, err error) {
 	if diagnostics.EnableServerStartMetric {
-		Diagnostics.Track(diagnostics.ServerStart, map[string]interface{}{
+		diagnostics.Diagnostics.Track(diagnostics.ServerStart, map[string]interface{}{
 			diagnostics.ServerStart: fmt.Sprint(time.Unix(misc.AppStartTime, 0)),
 		})
 	}
+	var gwDB, rtDB, batchrtDB, procerrDB jobsdb.ReadonlyHandleT
 
-	//Reload Config
-	loadConfig()
+	if err := gwDB.Setup("gw"); err != nil {
+		return nil, fmt.Errorf("setting up gw readonly db: %w", err)
+	}
+	gw = &gwDB
 
-	readonlyGatewayDB.Setup("gw")
-	readonlyRouterDB.Setup("rt")
-	readonlyBatchRouterDB.Setup("batch_rt")
-	readonlyProcErrorDB.Setup("proc_error")
+	if err := rtDB.Setup("rt"); err != nil {
+		return nil, fmt.Errorf("setting up gw readonly db: %w", err)
+	}
+	if err := batchrtDB.Setup("batch_rt"); err != nil {
+		return nil, fmt.Errorf("setting up batch_rt readonly db: %w", err)
+	}
+	router.RegisterAdminHandlers(&rtDB, &batchrtDB)
 
-	processor.RegisterAdminHandlers(&readonlyProcErrorDB)
-	router.RegisterAdminHandlers(&readonlyRouterDB, &readonlyBatchRouterDB)
+	if err := procerrDB.Setup("proc_error"); err != nil {
+		return nil, fmt.Errorf("setting up proc_error readonly db: %w", err)
+	}
+	processor.RegisterAdminHandlers(&procerrDB)
 
-	runtime.GOMAXPROCS(maxProcess)
+	return
 }
 
-//StartProcessor atomically starts processor process if not already started
-func StartProcessor(clearDB *bool, enableProcessor bool, gatewayDB, routerDB, batchRouterDB *jobsdb.HandleT, procErrorDB *jobsdb.HandleT) {
-	moduleLoadLock.Lock()
-	defer moduleLoadLock.Unlock()
+// NewRsourcesService produces a rsources.JobService through environment configuration (env variables & config file)
+func NewRsourcesService(deploymentType deployment.Type) (rsources.JobService, error) {
+	var rsourcesConfig rsources.JobServiceConfig
+	rsourcesConfig.MaxPoolSize = config.GetInt("Rsources.PoolSize", 5)
+	rsourcesConfig.LocalConn = misc.GetConnectionString()
+	rsourcesConfig.LocalHostname = config.GetString("DB.host", "localhost")
+	rsourcesConfig.SharedConn = config.GetString("SharedDB.dsn", "")
+	rsourcesConfig.SkipFailedRecordsCollection = !config.GetBool("Router.failedKeysEnabled", true)
 
-	if processorLoaded {
-		return
-	}
-
-	if enableProcessor {
-		var processor = processor.NewProcessor()
-		processor.Setup(backendconfig.DefaultBackendConfig, gatewayDB, routerDB, batchRouterDB, procErrorDB, clearDB)
-		processor.Start()
-
-		processorLoaded = true
-	}
-}
-
-//StartRouter atomically starts router process if not already started
-func StartRouter(enableRouter bool, routerDB, batchRouterDB, procErrorDB *jobsdb.HandleT) {
-	moduleLoadLock.Lock()
-	defer moduleLoadLock.Unlock()
-
-	if routerLoaded {
-		return
-	}
-
-	if enableRouter {
-		go monitorDestRouters(routerDB, batchRouterDB, procErrorDB)
-		routerLoaded = true
-	}
-}
-
-// Gets the config from config backend and extracts enabled writekeys
-func monitorDestRouters(routerDB, batchRouterDB, procErrorDB *jobsdb.HandleT) {
-	ch := make(chan utils.DataEvent)
-	backendconfig.Subscribe(ch, backendconfig.TopicBackendConfig)
-	dstToRouter := make(map[string]*router.HandleT)
-	dstToBatchRouter := make(map[string]*batchrouter.HandleT)
-	// dstToWhRouter := make(map[string]*warehouse.HandleT)
-
-	for {
-		config := <-ch
-		sources := config.Data.(backendconfig.ConfigT)
-		enabledDestinations := make(map[string]bool)
-		for _, source := range sources.Sources {
-			for _, destination := range source.Destinations {
-				enabledDestinations[destination.DestinationDefinition.Name] = true
-				//For batch router destinations
-				if misc.Contains(objectStorageDestinations, destination.DestinationDefinition.Name) || misc.Contains(warehouseDestinations, destination.DestinationDefinition.Name) {
-					_, ok := dstToBatchRouter[destination.DestinationDefinition.Name]
-					if !ok {
-						pkgLogger.Info("Starting a new Batch Destination Router ", destination.DestinationDefinition.Name)
-						var brt batchrouter.HandleT
-						brt.Setup(batchRouterDB, procErrorDB, destination.DestinationDefinition.Name)
-						dstToBatchRouter[destination.DestinationDefinition.Name] = &brt
-					}
-				} else {
-					_, ok := dstToRouter[destination.DestinationDefinition.Name]
-					if !ok {
-						pkgLogger.Info("Starting a new Destination ", destination.DestinationDefinition.Name)
-						var router router.HandleT
-						router.Setup(routerDB, procErrorDB, destination.DestinationDefinition)
-						dstToRouter[destination.DestinationDefinition.Name] = &router
-					}
-				}
-			}
+	if deploymentType == deployment.MultiTenantType {
+		// For multitenant deployment type we shall require the existence of a SHARED_DB
+		// TODO: change default value of Rsources.FailOnMissingSharedDB to true, when shared DB is provisioned
+		if rsourcesConfig.SharedConn == "" && config.GetBool("Rsources.FailOnMissingSharedDB", false) {
+			return nil, fmt.Errorf("deployment type %s requires SharedDB.dsn to be provided", deploymentType)
 		}
 	}
+
+	return rsources.NewJobService(rsourcesConfig)
+}
+
+func resolveModeProvider(log logger.Logger, deploymentType deployment.Type) (cluster.ChangeEventProvider, error) {
+	enableProcessor := config.GetBool("enableProcessor", true)
+	enableRouter := config.GetBool("enableRouter", true)
+	forceStaticMode := config.GetBool("forceStaticModeProvider", false)
+
+	var modeProvider cluster.ChangeEventProvider
+
+	staticModeProvider := func() cluster.ChangeEventProvider {
+		// FIXME: hacky way to determine server mode
+		if enableProcessor && enableRouter {
+			return state.NewStaticProvider(servermode.NormalMode)
+		}
+		return state.NewStaticProvider(servermode.DegradedMode)
+	}
+
+	if forceStaticMode {
+		log.Info("forcing the use of Static Cluster Manager")
+		modeProvider = staticModeProvider()
+	} else {
+		switch deploymentType {
+		case deployment.MultiTenantType:
+			log.Info("using ETCD Based Dynamic Cluster Manager")
+			modeProvider = state.NewETCDDynamicProvider()
+		case deployment.DedicatedType:
+			log.Info("using Static Cluster Manager")
+			modeProvider = staticModeProvider()
+		default:
+			return modeProvider, fmt.Errorf("unsupported deployment type: %q", deploymentType)
+		}
+	}
+	return modeProvider, nil
 }

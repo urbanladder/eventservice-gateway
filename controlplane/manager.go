@@ -32,17 +32,22 @@ type LoggerI interface {
 const defaultRetryInterval time.Duration = time.Second
 
 func (cm *ConnectionManager) Apply(url string, active bool) {
+	if url == "" {
+		return
+	}
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
 	cm.url = url
 
-	if active == true && !cm.active {
+	if active && !cm.active {
 		cm.active = true
+		cm.Logger.Infof(`Connection to CP Router not active. Establishing new connection`)
 		go cm.maintainConnection()
-	} else if active == false && cm.active {
+	} else if !active && cm.active {
 		cm.active = false
-		cm.closeConnection()
+		cm.Logger.Infof(`Closing connection to CP Router`)
+		_ = cm.closeConnection()
 	}
 }
 
@@ -63,8 +68,10 @@ func (cm *ConnectionManager) maintainConnection() {
 	for cm.active {
 		if err := cm.connect(); err != nil {
 			cm.Logger.Error(err.Error())
-		} else if err := cm.connHandler.ServeOnConnection(); err != nil {
-			cm.Logger.Error(err.Error())
+		} else {
+			if err := cm.connHandler.ServeOnConnection(); err != nil {
+				cm.Logger.Error(err.Error())
+			}
 		}
 
 		time.Sleep(cm.retryInterval())

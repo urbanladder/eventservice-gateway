@@ -1,25 +1,50 @@
-FROM 540798973460.dkr.ecr.us-east-1.amazonaws.com/golang_base:latest
 
-RUN apk add --update go git build-base
-#RUN go get github.com/onsi/ginkgo/ginkgo
+# syntax=docker/dockerfile:1
+ARG GO_VERSION=1.19
+ARG ALPINE_VERSION=3.16
+FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS builder
+ARG VERSION
+ARG REVISION
+ARG COMMIT_HASH
+ARG ENTERPRISE_TOKEN
+ARG RACE_ENABLED=false
+ARG CGO_ENABLED=0
+ARG PKG_NAME=github.com/rudderlabs/release-demo
 
-ENV LC_ALL=C
-ARG deploy_env=staging
+RUN apk add --update make tzdata ca-certificates
 
-# Set necessary environmet variables needed for our image
-ENV GO111MODULE=on \
-    CGO_ENABLED=0 \
-    GOOS=linux \
-    GOARCH=amd64
+WORKDIR /rudder-server
 
-WORKDIR /app
+COPY go.mod .
+COPY go.sum .
 
-# Create required directories for nginx and beaver
-RUN mkdir -p shared/pids public/system shared/sockets nginx/cache nginx/logs beaver
-RUN touch /etc/logrotate.d/app beaver/beaver.conf
+RUN go mod download
 
-COPY . ./
-RUN go build -o ./bin/event-gateway .
-ENV WORKSPACECONFIG_S3_URI=
-RUN chmod ug+x startup.sh
-ENTRYPOINT ["sh","/app/startup.sh"]
+COPY . .
+
+RUN BUILD_DATE=$(date "+%F,%T") \
+    LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT_HASH} -X main.buildDate=$BUILD_DATE -X main.builtBy=${REVISION} -X main.builtBy=${REVISION} -X main.enterpriseToken=${ENTERPRISE_TOKEN} " \
+    make build
+
+RUN go build -o devtool ./cmd/devtool/
+
+
+FROM alpine:${ALPINE_VERSION}
+
+RUN apk update && apk add tzdata
+RUN apk -U --no-cache upgrade && \
+    apk add --no-cache ca-certificates postgresql-client curl bash
+
+COPY --from=builder rudder-server/rudder-server .
+COPY --from=builder rudder-server/build/wait-for-go/wait-for-go .
+COPY --from=builder rudder-server/build/regulation-worker .
+COPY --from=builder rudder-server/devtool .
+
+COPY build/docker-entrypoint.sh /
+COPY build/wait-for /
+COPY ./rudder-cli/rudder-cli.linux.x86_64 /usr/bin/rudder-cli
+COPY scripts/generate-event /scripts/generate-event
+COPY scripts/batch.json /scripts/batch.json
+
+ENTRYPOINT ["/docker-entrypoint.sh"]
+CMD ["/rudder-server"]

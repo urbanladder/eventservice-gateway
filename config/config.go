@@ -1,248 +1,299 @@
+// Package config uses the exact same precedence order as Viper, where
+// each item takes precedence over the item below it:
+//
+//   - explicit call to Set (case insensitive)
+//   - flag (case insensitive)
+//   - env (case sensitive - see notes below)
+//   - config (case insensitive)
+//   - key/value store (case insensitive)
+//   - default (case insensitive)
+//
+// Environment variable resolution is performed based on the following rules:
+//   - If the key contains only uppercase characters, numbers and underscores, the environment variable is looked up in its entirety, e.g. SOME_VARIABLE -> SOME_VARIABLE
+//   - In all other cases, the environment variable is transformed before being looked up as following:
+//     1. camelCase is converted to snake_case, e.g. someVariable -> some_variable
+//     2. dots (.) are replaced with underscores (_), e.g. some.variable -> some_variable
+//     3. the resulting string is uppercased and prefixed with RSERVER_, e.g. some_variable -> RSERVER_SOME_VARIABLE
 package config
 
 import (
 	"fmt"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/joho/godotenv"
-	"github.com/spf13/cast"
 	"github.com/spf13/viper"
 )
 
-var matchAllCap = regexp.MustCompile("([a-z0-9])([A-Z])")
+// regular expression matching lowercase letter followed by an uppercase letter
+var camelCaseMatch = regexp.MustCompile("([a-z0-9])([A-Z])")
 
-var (
-	whSchemaVersion string
-)
+// regular expression matching uppercase letters contained in environment variable names
+var upperCaseMatch = regexp.MustCompile("^[A-Z0-9_]+$")
 
-// Rudder server supported config constants
-const (
-	EmbeddedMode      = "embedded"
-	MasterMode        = "master"
-	MasterSlaveMode   = "master_and_slave"
-	SlaveMode         = "slave"
-	OffMode           = "off"
-	PooledWHSlaveMode = "embedded_master"
-)
-
-//TransformKey as package method to get the formatted env from a give string
-func TransformKey(s string) string {
-	snake := matchAllCap.ReplaceAllString(s, "${1}_${2}")
-	snake = strings.ReplaceAll(snake, ".", "_")
-	return "RSERVER_" + strings.ToUpper(snake)
-}
-
-// Initialize used to initialize config package
-// Deprecated - There is no need to directly call Initialize, config is initialized via its package init()
-func Initialize() {
-}
+// default, singleton config instance
+var Default *Config
 
 func init() {
-	if err := godotenv.Load(); err != nil {
-		fmt.Println("INFO: No .env file found.")
-	}
-
-	configPath := GetEnv("CONFIG_PATH", "./config/config.toml")
-
-	viper.SetConfigFile(configPath)
-	viper.AddConfigPath(".")
-	err := viper.ReadInConfig() // Find and read the config file
-	// Don't panic if config.toml is not found or error with parsing. Use the default config values instead
-	if err != nil {
-		fmt.Println("[Config] :: Failed to parse Config toml, using default values:", err)
-	}
+	Default = New()
 }
 
-//GetBool is a wrapper for viper's GetBool
+// Reset resets the default, singleton config instance.
+// Shall only be used by tests, until we move to a proper DI framework
+func Reset() {
+	Default = New()
+}
+
+// New creates a new config instance
+func New() *Config {
+	c := &Config{}
+	c.load()
+	return c
+}
+
+// Config is the entry point for accessing configuration
+type Config struct {
+	vLock                   sync.RWMutex // protects reading and writing to the config (viper is not thread-safe)
+	v                       *viper.Viper
+	hotReloadableConfigLock sync.RWMutex // protects map holding hot reloadable config keys
+	hotReloadableConfig     map[string][]*configValue
+	envsLock                sync.RWMutex // protects the envs map below
+	envs                    map[string]string
+}
+
+// GetBool gets bool value from config
 func GetBool(key string, defaultValue bool) (value bool) {
-
-	envVal := GetEnv(TransformKey(key), "")
-	if envVal != "" {
-		return cast.ToBool(envVal)
-	}
-
-	if !viper.IsSet(key) {
-		return defaultValue
-	}
-	return viper.GetBool(key)
+	return Default.GetBool(key, defaultValue)
 }
 
-// GetInt is wrapper for viper's GetInt
+// GetBool gets bool value from config
+func (c *Config) GetBool(key string, defaultValue bool) (value bool) {
+	c.vLock.RLock()
+	defer c.vLock.RUnlock()
+	if !c.IsSet(key) {
+		return defaultValue
+	}
+	return c.v.GetBool(key)
+}
+
+// GetInt gets int value from config
 func GetInt(key string, defaultValue int) (value int) {
-
-	envVal := GetEnv(TransformKey(key), "")
-	if envVal != "" {
-		return cast.ToInt(envVal)
-	}
-
-	if !viper.IsSet(key) {
-		return defaultValue
-	}
-	return viper.GetInt(key)
+	return Default.GetInt(key, defaultValue)
 }
 
-// GetInt64 is wrapper for viper's GetInt
+// GetInt gets int value from config
+func (c *Config) GetInt(key string, defaultValue int) (value int) {
+	c.vLock.RLock()
+	defer c.vLock.RUnlock()
+	if !c.IsSet(key) {
+		return defaultValue
+	}
+	return c.v.GetInt(key)
+}
+
+// GetStringMap gets string map value from config
+func GetStringMap(key string, defaultValue map[string]interface{}) (value map[string]interface{}) {
+	return Default.GetStringMap(key, defaultValue)
+}
+
+// GetStringMap gets string map value from config
+func (c *Config) GetStringMap(key string, defaultValue map[string]interface{}) (value map[string]interface{}) {
+	c.vLock.RLock()
+	defer c.vLock.RUnlock()
+	if !c.IsSet(key) {
+		return defaultValue
+	}
+	return c.v.GetStringMap(key)
+}
+
+// MustGetInt gets int value from config or panics if the config doesn't exist
+func MustGetInt(key string) (value int) {
+	return Default.MustGetInt(key)
+}
+
+// MustGetInt gets int value from config or panics if the config doesn't exist
+func (c *Config) MustGetInt(key string) (value int) {
+	c.vLock.RLock()
+	defer c.vLock.RUnlock()
+	if !c.IsSet(key) {
+		panic(fmt.Errorf("config key %s not found", key))
+	}
+	return c.v.GetInt(key)
+}
+
+// GetInt64 gets int64 value from config
 func GetInt64(key string, defaultValue int64) (value int64) {
-
-	envVal := GetEnv(TransformKey(key), "")
-	if envVal != "" {
-		return cast.ToInt64(envVal)
-	}
-
-	if !viper.IsSet(key) {
-		return defaultValue
-	}
-	return viper.GetInt64(key)
+	return Default.GetInt64(key, defaultValue)
 }
 
-// GetFloat64 is wrapper for viper's GetFloat64
+// GetInt64 gets int64 value from config
+func (c *Config) GetInt64(key string, defaultValue int64) (value int64) {
+	c.vLock.RLock()
+	defer c.vLock.RUnlock()
+	if !c.IsSet(key) {
+		return defaultValue
+	}
+	return c.v.GetInt64(key)
+}
+
+// GetFloat64 gets float64 value from config
 func GetFloat64(key string, defaultValue float64) (value float64) {
-
-	envVal := GetEnv(TransformKey(key), "")
-	if envVal != "" {
-		return cast.ToFloat64(envVal)
-	}
-
-	if !viper.IsSet(key) {
-		return defaultValue
-	}
-	return viper.GetFloat64(key)
+	return Default.GetFloat64(key, defaultValue)
 }
 
-// GetString is wrapper for viper's GetString
-func GetString(key string, defaultValue string) (value string) {
-
-	envVal := GetEnv(TransformKey(key), "")
-	if envVal != "" {
-		return envVal
-	}
-
-	if !viper.IsSet(key) {
+// GetFloat64 gets float64 value from config
+func (c *Config) GetFloat64(key string, defaultValue float64) (value float64) {
+	c.vLock.RLock()
+	defer c.vLock.RUnlock()
+	if !c.IsSet(key) {
 		return defaultValue
 	}
-	return viper.GetString(key)
+	return c.v.GetFloat64(key)
 }
 
-// GetDuration is wrapper for viper's GetDuration
-func GetDuration(key string, defaultValue time.Duration) (value time.Duration) {
+// GetString gets string value from config
+func GetString(key, defaultValue string) (value string) {
+	return Default.GetString(key, defaultValue)
+}
 
-	envVal := GetEnv(TransformKey(key), "")
-	if envVal != "" {
-		return cast.ToDuration(envVal)
-	}
-
-	if !viper.IsSet(key) {
+// GetString gets string value from config
+func (c *Config) GetString(key, defaultValue string) (value string) {
+	c.vLock.RLock()
+	defer c.vLock.RUnlock()
+	if !c.IsSet(key) {
 		return defaultValue
 	}
-	return viper.GetDuration(key)
+	return c.v.GetString(key)
+}
+
+// MustGetString gets string value from config or panics if the config doesn't exist
+func MustGetString(key string) (value string) {
+	return Default.MustGetString(key)
+}
+
+// MustGetString gets string value from config or panics if the config doesn't exist
+func (c *Config) MustGetString(key string) (value string) {
+	c.vLock.RLock()
+	defer c.vLock.RUnlock()
+	if !c.IsSet(key) {
+		panic(fmt.Errorf("config key %s not found", key))
+	}
+	return c.v.GetString(key)
+}
+
+// GetStringSlice gets string slice value from config
+func GetStringSlice(key string, defaultValue []string) (value []string) {
+	return Default.GetStringSlice(key, defaultValue)
+}
+
+// GetStringSlice gets string slice value from config
+func (c *Config) GetStringSlice(key string, defaultValue []string) (value []string) {
+	c.vLock.RLock()
+	defer c.vLock.RUnlock()
+	if !c.IsSet(key) {
+		return defaultValue
+	}
+	return c.v.GetStringSlice(key)
+}
+
+// GetDuration gets duration value from config
+func GetDuration(key string, defaultValueInTimescaleUnits int64, timeScale time.Duration) (value time.Duration) {
+	return Default.GetDuration(key, defaultValueInTimescaleUnits, timeScale)
+}
+
+// GetDuration gets duration value from config
+func (c *Config) GetDuration(key string, defaultValueInTimescaleUnits int64, timeScale time.Duration) (value time.Duration) {
+	c.vLock.RLock()
+	defer c.vLock.RUnlock()
+	if !c.IsSet(key) {
+		return time.Duration(defaultValueInTimescaleUnits) * timeScale
+	} else {
+		v := c.v.GetString(key)
+		parseDuration, err := time.ParseDuration(v)
+		if err == nil {
+			return parseDuration
+		} else {
+			_, err = strconv.ParseFloat(v, 64)
+			if err == nil {
+				return c.v.GetDuration(key) * timeScale
+			} else {
+				return time.Duration(defaultValueInTimescaleUnits) * timeScale
+			}
+		}
+	}
 }
 
 // IsSet checks if config is set for a key
 func IsSet(key string) bool {
-	if _, exists := os.LookupEnv(TransformKey(key)); exists {
-		return true
-	}
-
-	return viper.IsSet(key)
+	return Default.IsSet(key)
 }
 
-// IsEnvSet checks if an environment variable is set
-func IsEnvSet(key string) bool {
-	_, exists := os.LookupEnv(key)
-	return exists
-}
-
-// GetEnv returns the environment value stored in key variable
-func GetEnv(key string, defaultVal string) string {
-	if value, exists := os.LookupEnv(key); exists {
-		return value
-	}
-	return defaultVal
-}
-
-// GetEnvAsInt returns the int value of environment value stored in the key variable
-// If not set, default value will be return. If set but unparsable, returns 0
-func GetEnvAsInt(key string, defaultVal int) int {
-	stringValue, exists := os.LookupEnv(key)
-	if !exists {
-		return defaultVal
-	}
-	if value, err := strconv.Atoi(stringValue); err == nil {
-		return value
-	}
-	return 0
-}
-
-// GetRequiredEnvAsInt returns the environment value stored in key variable as int, no default
-func GetRequiredEnvAsInt(key string) int {
-	stringValue, exists := os.LookupEnv(key)
-	if !exists {
-		panic(fmt.Errorf("Fatal error, no required environment variable: %s", key))
-	}
-	if value, err := strconv.Atoi(stringValue); err == nil {
-		return value
-	}
-	panic(fmt.Sprintf("Unable to parse the value of %s env variable. Value : %s", key, stringValue))
-}
-
-// GetEnvAsBool returns the boolean environment value stored in key variable
-func GetEnvAsBool(name string, defaultVal bool) bool {
-	valueStr := GetEnv(name, "")
-	if value, err := strconv.ParseBool(valueStr); err == nil {
-		return value
-	}
-
-	return defaultVal
-}
-
-// GetRequiredEnv returns the environment value stored in key variable, no default
-func GetRequiredEnv(key string) string {
-	if value, exists := os.LookupEnv(key); exists {
-		return value
-	}
-	panic(fmt.Errorf("Fatal error, no required environment variable: %s", key))
+// IsSet checks if config is set for a key
+func (c *Config) IsSet(key string) bool {
+	c.vLock.RLock()
+	defer c.vLock.RUnlock()
+	c.bindEnv(key)
+	return c.v.IsSet(key)
 }
 
 // Override Config by application or command line
 
-// SetBool override existing config
-func SetBool(key string, value bool) {
-	viper.Set(key, value)
+// Set override existing config
+func Set(key string, value interface{}) {
+	Default.Set(key, value)
 }
 
-func SetString(key string, value string) {
-	viper.Set(key, value)
+// Set override existing config
+func (c *Config) Set(key string, value interface{}) {
+	c.vLock.Lock()
+	c.v.Set(key, value)
+	c.vLock.Unlock()
+	c.onConfigChange()
 }
 
-//GetWorkspaceToken returns the workspace token provided in the environment variables
-//Env variable CONFIG_BACKEND_TOKEN is deprecating soon
-//WORKSPACE_TOKEN is newly introduced. This will override CONFIG_BACKEND_TOKEN
-func GetWorkspaceToken() string {
-	token := GetEnv("WORKSPACE_TOKEN", "")
-	if token != "" && token != "<your_token_here>" {
-		return token
+// bindEnv handles rudder server's unique snake case replacement by registering
+// the environment variables to viper, that would otherwise be ignored.
+// Viper uppercases keys before sending them to its EnvKeyReplacer, thus
+// the replacer cannot detect camelCase keys.
+func (c *Config) bindEnv(key string) {
+	envVar := key
+	if !upperCaseMatch.MatchString(key) {
+		envVar = ConfigKeyToEnv(key)
 	}
-
-	return GetEnv("CONFIG_BACKEND_TOKEN", "")
+	// bind once
+	c.envsLock.RLock()
+	if _, ok := c.envs[key]; !ok {
+		c.envsLock.RUnlock()
+		c.envsLock.Lock() // don't really care about race here, setting the same value
+		c.envs[strings.ToUpper(key)] = envVar
+		c.envsLock.Unlock()
+	} else {
+		c.envsLock.RUnlock()
+	}
 }
 
-// returns value stored in KUBE_NAMESPACE env var
-func GetKubeNamespace() string {
-	return GetEnv("KUBE_NAMESPACE", "")
+type envReplacer struct {
+	c *Config
 }
 
-func SetWHSchemaVersion(version string) {
-	whSchemaVersion = version
+func (r *envReplacer) Replace(s string) string {
+	r.c.envsLock.RLock()
+	defer r.c.envsLock.RUnlock()
+	if v, ok := r.c.envs[s]; ok {
+		return v
+	}
+	return s // bound environment variables
 }
 
-func GetWHSchemaVersion() string {
-	return whSchemaVersion
-}
-
-func GetVarCharMaxForRS() bool {
-	return GetBool("Warehouse.redshift.setVarCharMax", false)
+// Fallback environment variables supported (historically) by rudder-server
+func bindLegacyEnv(v *viper.Viper) {
+	_ = v.BindEnv("DB.host", "JOBS_DB_HOST")
+	_ = v.BindEnv("DB.user", "JOBS_DB_USER")
+	_ = v.BindEnv("DB.name", "JOBS_DB_DB_NAME")
+	_ = v.BindEnv("DB.port", "JOBS_DB_PORT")
+	_ = v.BindEnv("DB.password", "JOBS_DB_PASSWORD")
+	_ = v.BindEnv("DB.sslMode", "JOBS_DB_SSL_MODE")
+	_ = v.BindEnv("SharedDB.dsn", "SHARED_DB_DSN")
 }

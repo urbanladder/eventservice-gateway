@@ -6,75 +6,92 @@ import (
 	"fmt"
 	"reflect"
 
+	"github.com/rudderlabs/rudder-server/warehouse/integrations/manager"
+
 	"github.com/rudderlabs/rudder-server/utils/misc"
 	"github.com/rudderlabs/rudder-server/utils/timeutil"
-	"github.com/rudderlabs/rudder-server/warehouse/manager"
+	"github.com/rudderlabs/rudder-server/warehouse/internal/model"
 	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
 )
 
 type SchemaHandleT struct {
-	dbHandle          *sql.DB
-	stagingFiles      []*StagingFileT
-	warehouse         warehouseutils.WarehouseT
-	localSchema       warehouseutils.SchemaT
-	schemaInWarehouse warehouseutils.SchemaT
-	uploadSchema      warehouseutils.SchemaT
+	dbHandle                      *sql.DB
+	stagingFiles                  []*model.StagingFile
+	warehouse                     warehouseutils.Warehouse
+	localSchema                   warehouseutils.SchemaT
+	schemaInWarehouse             warehouseutils.SchemaT
+	unrecognizedSchemaInWarehouse warehouseutils.SchemaT
+	uploadSchema                  warehouseutils.SchemaT
 }
 
-func handleSchemaChange(existingDataType string, columnType string, columnVal interface{}) (newColumnVal interface{}, ok bool) {
-	if existingDataType == "string" || existingDataType == "text" {
-		newColumnVal = fmt.Sprintf("%v", columnVal)
-	} else if (columnType == "int" || columnType == "bigint") && existingDataType == "float" {
-		newColumnVal = columnVal
-	} else if columnType == "float" && (existingDataType == "int" || existingDataType == "bigint") {
-		floatVal, ok := columnVal.(float64)
+func HandleSchemaChange(existingDataType, currentDataType model.SchemaType, value any) (any, error) {
+	var (
+		newColumnVal any
+		err          error
+	)
+
+	if existingDataType == model.StringDataType || existingDataType == model.TextDataType {
+		// only stringify if the previous type is non-string/text/json
+		if currentDataType != model.StringDataType && currentDataType != model.TextDataType && currentDataType != model.JSONDataType {
+			newColumnVal = fmt.Sprintf("%v", value)
+		} else {
+			newColumnVal = value
+		}
+	} else if (currentDataType == model.IntDataType || currentDataType == model.BigIntDataType) && existingDataType == model.FloatDataType {
+		intVal, ok := value.(int)
 		if !ok {
-			newColumnVal = nil
+			err = ErrIncompatibleSchemaConversion
+		} else {
+			newColumnVal = float64(intVal)
+		}
+	} else if currentDataType == model.FloatDataType && (existingDataType == model.IntDataType || existingDataType == model.BigIntDataType) {
+		floatVal, ok := value.(float64)
+		if !ok {
+			err = ErrIncompatibleSchemaConversion
 		} else {
 			newColumnVal = int(floatVal)
 		}
+	} else if existingDataType == model.JSONDataType {
+		var interfaceSliceSample []any
+		if currentDataType == model.IntDataType || currentDataType == model.FloatDataType || currentDataType == model.BooleanDataType {
+			newColumnVal = fmt.Sprintf("%v", value)
+		} else if reflect.TypeOf(value) == reflect.TypeOf(interfaceSliceSample) {
+			newColumnVal = value
+		} else {
+			newColumnVal = fmt.Sprintf(`"%v"`, value)
+		}
 	} else {
-		return nil, false
+		err = ErrSchemaConversionNotSupported
 	}
 
-	return newColumnVal, true
+	return newColumnVal, err
 }
 
-func (jobRun *JobRunT) handleDiscardTypes(tableName string, columnName string, columnVal interface{}, columnData DataT, gzWriter misc.GZipWriter) error {
-	job := jobRun.job
-	rowID, hasID := columnData[job.getColumnName("id")]
-	receivedAt, hasReceivedAt := columnData[job.getColumnName("received_at")]
-	if hasID && hasReceivedAt {
-		eventLoader := warehouseutils.GetNewEventLoader(job.DestinationType)
-		eventLoader.AddColumn("column_name", columnName)
-		eventLoader.AddColumn("column_value", fmt.Sprintf("%v", columnVal))
-		eventLoader.AddColumn("received_at", receivedAt)
-		eventLoader.AddColumn("row_id", rowID)
-		eventLoader.AddColumn("table_name", tableName)
-		if eventLoader.IsLoadTimeColumn("uuid_ts") {
-			timestampFormat := eventLoader.GetLoadTimeFomat("uuid_ts")
-			eventLoader.AddColumn("uuid_ts", jobRun.uuidTS.Format(timestampFormat))
-		}
-		if eventLoader.IsLoadTimeColumn("loaded_at") {
-			timestampFormat := eventLoader.GetLoadTimeFomat("loaded_at")
-			eventLoader.AddColumn("loaded_at", jobRun.uuidTS.Format(timestampFormat))
-		}
-
-		eventData, err := eventLoader.WriteToString()
-		if err != nil {
-			return err
-		}
-		gzWriter.WriteGZ(eventData)
-	}
-	return nil
-}
-
-func (sHandle *SchemaHandleT) getLocalSchema() (currentSchema warehouseutils.SchemaT) {
-	destID := sHandle.warehouse.Destination.ID
-	namespace := sHandle.warehouse.Namespace
+func (sh *SchemaHandleT) getLocalSchema() (currentSchema warehouseutils.SchemaT) {
+	sourceID := sh.warehouse.Source.ID
+	destID := sh.warehouse.Destination.ID
+	namespace := sh.warehouse.Namespace
 
 	var rawSchema json.RawMessage
-	sqlStatement := fmt.Sprintf(`SELECT schema FROM %[1]s WHERE (%[1]s.destination_id='%[2]s' AND %[1]s.namespace='%[3]s') ORDER BY %[1]s.id DESC`, warehouseutils.WarehouseSchemasTable, destID, namespace)
+	sqlStatement := fmt.Sprintf(`
+		SELECT
+		  schema
+		FROM
+		  %[1]s ST
+		WHERE
+		  (
+			ST.destination_id = '%[2]s'
+			AND ST.namespace = '%[3]s'
+			AND ST.source_id = '%[4]s'
+		  )
+		ORDER BY
+		  ST.id DESC;
+`,
+		warehouseutils.WarehouseSchemasTable,
+		destID,
+		namespace,
+		sourceID,
+	)
 	pkgLogger.Infof("[WH]: Fetching current schema from wh postgresql: %s", sqlStatement)
 
 	err := dbHandle.QueryRow(sqlStatement).Scan(&rawSchema)
@@ -90,56 +107,76 @@ func (sHandle *SchemaHandleT) getLocalSchema() (currentSchema warehouseutils.Sch
 	var schemaMapInterface map[string]interface{}
 	err = json.Unmarshal(rawSchema, &schemaMapInterface)
 	if err != nil {
-		panic(fmt.Errorf("Unmarshalling: %s failed with Error : %w", rawSchema, err))
+		panic(fmt.Errorf("unmarshalling: %s failed with Error : %w", rawSchema, err))
 	}
 	currentSchema = warehouseutils.SchemaT{}
-	for tname, columnMapInterface := range schemaMapInterface {
+	for tableName, columnMapInterface := range schemaMapInterface {
 		columnMap := make(map[string]string)
 		columns := columnMapInterface.(map[string]interface{})
 		for cName, cTypeInterface := range columns {
 			columnMap[cName] = cTypeInterface.(string)
 		}
-		currentSchema[tname] = columnMap
+		currentSchema[tableName] = columnMap
 	}
 	return currentSchema
 }
 
-func (sHandle *SchemaHandleT) updateLocalSchema(updatedSchema warehouseutils.SchemaT) error {
-	namespace := sHandle.warehouse.Namespace
-	sourceID := sHandle.warehouse.Source.ID
-	destID := sHandle.warehouse.Destination.ID
-	destType := sHandle.warehouse.Type
+func (sh *SchemaHandleT) updateLocalSchema(updatedSchema warehouseutils.SchemaT) error {
+	namespace := sh.warehouse.Namespace
+	sourceID := sh.warehouse.Source.ID
+	destID := sh.warehouse.Destination.ID
+	destType := sh.warehouse.Type
 	marshalledSchema, err := json.Marshal(updatedSchema)
+	defer func() {
+		if err != nil {
+			pkgLogger.Infof("Failed to update local schema for with error: %s", err.Error())
+		}
+	}()
 	if err != nil {
 		return err
 	}
 
-	sqlStatement := fmt.Sprintf(`INSERT INTO %s (source_id, namespace, destination_id, destination_type, schema, created_at, updated_at)
-								VALUES ($1, $2, $3, $4, $5, $6, $7)
-								ON CONFLICT (source_id, destination_id, namespace)
-								DO
-								UPDATE SET schema=$5, updated_at = $7 RETURNING id
-								`, warehouseutils.WarehouseSchemasTable)
+	sqlStatement := fmt.Sprintf(`
+		INSERT INTO %s (
+		  source_id, namespace, destination_id,
+		  destination_type, schema, created_at,
+		  updated_at
+		)
+		VALUES
+		  ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (
+			source_id, destination_id, namespace
+		  ) DO
+		UPDATE
+		SET
+		  schema = $5,
+		  updated_at = $7 RETURNING id;
+`,
+		warehouseutils.WarehouseSchemasTable,
+	)
 	updatedAt := timeutil.Now()
-	_, err = dbHandle.Exec(sqlStatement, sourceID, namespace, destID, destType, marshalledSchema, timeutil.Now(), updatedAt)
+	_, err = dbHandle.Exec(
+		sqlStatement,
+		sourceID,
+		namespace,
+		destID,
+		destType,
+		marshalledSchema,
+		timeutil.Now(),
+		updatedAt,
+	)
 	return err
 }
 
-func (sHandle *SchemaHandleT) fetchSchemaFromWarehouse() (schemaInWarehouse warehouseutils.SchemaT, err error) {
-	whManager, err := manager.New(sHandle.warehouse.Type)
-	if err != nil {
-		panic(err)
-	}
-
-	schemaInWarehouse, err = whManager.FetchSchema(sHandle.warehouse)
+func (sh *SchemaHandleT) fetchSchemaFromWarehouse(whManager manager.Manager) (schemaInWarehouse, unrecognizedSchemaInWarehouse warehouseutils.SchemaT, err error) {
+	schemaInWarehouse, unrecognizedSchemaInWarehouse, err = whManager.FetchSchema(sh.warehouse)
 	if err != nil {
 		pkgLogger.Errorf(`[WH]: Failed fetching schema from warehouse: %v`, err)
-		return warehouseutils.SchemaT{}, err
+		return warehouseutils.SchemaT{}, warehouseutils.SchemaT{}, err
 	}
-	return schemaInWarehouse, nil
+	return schemaInWarehouse, unrecognizedSchemaInWarehouse, nil
 }
 
-func mergeSchema(currentSchema warehouseutils.SchemaT, schemaList []warehouseutils.SchemaT, currentMergedSchema warehouseutils.SchemaT, warehouseType string) warehouseutils.SchemaT {
+func MergeSchema(currentSchema warehouseutils.SchemaT, schemaList []warehouseutils.SchemaT, currentMergedSchema warehouseutils.SchemaT, warehouseType string) warehouseutils.SchemaT {
 	if len(currentMergedSchema) == 0 {
 		currentMergedSchema = warehouseutils.SchemaT{}
 	}
@@ -151,6 +188,10 @@ func mergeSchema(currentSchema warehouseutils.SchemaT, schemaList []warehouseuti
 		}
 		if columnTypeInDB == "string" && columnType == "text" {
 			currentMergedSchema[tableName][columnName] = columnType
+			return true
+		}
+		// if columnTypeInDB is text, then we should not change it to string
+		if currentMergedSchema[tableName][columnName] == "text" {
 			return true
 		}
 		currentMergedSchema[tableName][columnName] = columnTypeInDB
@@ -205,21 +246,18 @@ func mergeSchema(currentSchema warehouseutils.SchemaT, schemaList []warehouseuti
 	return currentMergedSchema
 }
 
-func (sHandle *SchemaHandleT) safeName(columnName string) string {
-	return warehouseutils.ToProviderCase(sHandle.warehouse.Type, columnName)
+func (sh *SchemaHandleT) safeName(columnName string) string {
+	return warehouseutils.ToProviderCase(sh.warehouse.Type, columnName)
 }
 
 func (sh *SchemaHandleT) getDiscardsSchema() map[string]string {
-	discards := map[string]string{
-		sh.safeName("table_name"):   "string",
-		sh.safeName("row_id"):       "string",
-		sh.safeName("column_name"):  "string",
-		sh.safeName("column_value"): "string",
-		sh.safeName("received_at"):  "datetime",
-		sh.safeName("uuid_ts"):      "datetime",
+	discards := map[string]string{}
+	for colName, colType := range warehouseutils.DiscardsSchema {
+		discards[sh.safeName(colName)] = colType
 	}
+
 	// add loaded_at for bq to be segment compatible
-	if sh.warehouse.Type == "BQ" {
+	if sh.warehouse.Type == warehouseutils.BQ {
 		discards[sh.safeName("loaded_at")] = "datetime"
 	}
 	return discards
@@ -244,7 +282,7 @@ func (sh *SchemaHandleT) getIdentitiesMappingsSchema() map[string]string {
 }
 
 func (sh *SchemaHandleT) isIDResolutionEnabled() bool {
-	return warehouseutils.IDResolutionEnabled() && misc.ContainsString(warehouseutils.IdentityEnabledWarehouses, sh.warehouse.Type)
+	return warehouseutils.IDResolutionEnabled() && misc.Contains(warehouseutils.IdentityEnabledWarehouses, sh.warehouse.Type)
 }
 
 func (sh *SchemaHandleT) consolidateStagingFilesSchemaUsingWarehouseSchema() warehouseutils.SchemaT {
@@ -263,7 +301,17 @@ func (sh *SchemaHandleT) consolidateStagingFilesSchemaUsingWarehouseSchema() war
 			ids = append(ids, stagingFile.ID)
 		}
 
-		sqlStatement := fmt.Sprintf(`SELECT schema FROM %s WHERE id IN (%s)`, warehouseutils.WarehouseStagingFilesTable, misc.IntArrayToString(ids, ","))
+		sqlStatement := fmt.Sprintf(`
+			SELECT
+			  schema
+			FROM
+			  %s
+			WHERE
+			  id IN (%s);
+`,
+			warehouseutils.WarehouseStagingFilesTable,
+			misc.IntArrayToString(ids, ","),
+		)
 		rows, err := sh.dbHandle.Query(sqlStatement)
 		if err != nil && err != sql.ErrNoRows {
 			panic(fmt.Errorf("Query: %s\nfailed with Error : %w", sqlStatement, err))
@@ -279,14 +327,14 @@ func (sh *SchemaHandleT) consolidateStagingFilesSchemaUsingWarehouseSchema() war
 			var schema warehouseutils.SchemaT
 			err = json.Unmarshal(s, &schema)
 			if err != nil {
-				panic(fmt.Errorf("Unmarshalling: %s failed with Error : %w", string(s), err))
+				panic(fmt.Errorf("unmarshalling: %s failed with Error : %w", string(s), err))
 			}
 
 			schemas = append(schemas, schema)
 		}
-		rows.Close()
+		_ = rows.Close()
 
-		consolidatedSchema = mergeSchema(schemaInLocalDB, schemas, consolidatedSchema, sh.warehouse.Type)
+		consolidatedSchema = MergeSchema(schemaInLocalDB, schemas, consolidatedSchema, sh.warehouse.Type)
 
 		count += stagingFilesSchemaPaginationSize
 		if count >= len(sh.stagingFiles) {
@@ -308,15 +356,42 @@ func (sh *SchemaHandleT) consolidateStagingFilesSchemaUsingWarehouseSchema() war
 	return consolidatedSchema
 }
 
-func compareSchema(sch1, sch2 map[string]map[string]string) bool {
-	eq := reflect.DeepEqual(sch1, sch2)
-	return eq
+// hasSchemaChanged Default behaviour is to do the deep equals.
+// If we are skipping deep equals, then we are validating local schemas against warehouse schemas only.
+// Not the other way around.
+func hasSchemaChanged(localSchema, schemaInWarehouse warehouseutils.SchemaT) bool {
+	if !skipDeepEqualSchemas {
+		eq := reflect.DeepEqual(localSchema, schemaInWarehouse)
+		return !eq
+	}
+	// Iterating through all tableName in the localSchema
+	for tableName := range localSchema {
+		localColumns := localSchema[tableName]
+		warehouseColumns, whColumnsExist := schemaInWarehouse[tableName]
+
+		// If warehouse does  not contain the specified table return true.
+		if !whColumnsExist {
+			return true
+		}
+		for columnName := range localColumns {
+			localColumn := localColumns[columnName]
+			warehouseColumn := warehouseColumns[columnName]
+
+			// If warehouse does not contain the specified column return true.
+			// If warehouse column does not match with the local one return true
+			if localColumn != warehouseColumn {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func getTableSchemaDiff(tableName string, currentSchema, uploadSchema warehouseutils.SchemaT) (diff warehouseutils.TableSchemaDiffT) {
 	diff = warehouseutils.TableSchemaDiffT{
-		ColumnMap:     make(map[string]string),
-		UpdatedSchema: make(map[string]string),
+		ColumnMap:        make(map[string]string),
+		UpdatedSchema:    make(map[string]string),
+		AlteredColumnMap: make(map[string]string),
 	}
 
 	var currentTableSchema map[string]string
@@ -343,10 +418,49 @@ func getTableSchemaDiff(tableName string, currentSchema, uploadSchema warehouseu
 			diff.UpdatedSchema[columnName] = columnType
 			diff.Exists = true
 		} else if columnType == "text" && currentTableSchema[columnName] == "string" {
-			diff.StringColumnsToBeAlteredToText = append(diff.StringColumnsToBeAlteredToText, columnName)
+			diff.AlteredColumnMap[columnName] = columnType
 			diff.UpdatedSchema[columnName] = columnType
 			diff.Exists = true
 		}
 	}
 	return diff
+}
+
+// returns the merged schema(uploadSchema+schemaInWarehousePreUpload) for all tables in uploadSchema
+func mergeUploadAndLocalSchemas(uploadSchema, schemaInWarehousePreUpload warehouseutils.SchemaT) warehouseutils.SchemaT {
+	mergedSchema := warehouseutils.SchemaT{}
+	// iterate over all tables in uploadSchema
+	for uploadTableName, uploadTableSchema := range uploadSchema {
+		if _, ok := mergedSchema[uploadTableName]; !ok {
+			// init map if it does not exist
+			mergedSchema[uploadTableName] = map[string]string{}
+		}
+
+		// uploadSchema becomes the merged schema if the table does not exist in local Schema
+		localTableSchema, ok := schemaInWarehousePreUpload[uploadTableName]
+		if !ok {
+			mergedSchema[uploadTableName] = uploadTableSchema
+			continue
+		}
+
+		// iterate over all columns in localSchema and add them to merged schema
+		for localColName, localColType := range localTableSchema {
+			mergedSchema[uploadTableName][localColName] = localColType
+		}
+
+		// iterate over all columns in uploadSchema and add them to merged schema if required
+		for uploadColName, uploadColType := range uploadTableSchema {
+			localColType, ok := localTableSchema[uploadColName]
+			// add uploadCol to mergedSchema if the col does not exist in localSchema
+			if !ok {
+				mergedSchema[uploadTableName][uploadColName] = uploadColType
+				continue
+			}
+			// change type of uploadCol to text if it was string in localSchema
+			if uploadColType == "text" && localColType == "string" {
+				mergedSchema[uploadTableName][uploadColName] = uploadColType
+			}
+		}
+	}
+	return mergedSchema
 }

@@ -1,10 +1,9 @@
 package identity
 
 import (
-	"bytes"
 	"compress/gzip"
+	"context"
 	"database/sql"
-	"encoding/csv"
 	"fmt"
 	"io"
 	"os"
@@ -18,10 +17,9 @@ import (
 	"github.com/rudderlabs/rudder-server/utils/logger"
 	"github.com/rudderlabs/rudder-server/utils/misc"
 	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
-	uuid "github.com/satori/go.uuid"
 )
 
-var pkgLogger logger.LoggerI
+var pkgLogger logger.Logger
 
 func init() {
 	pkgLogger = logger.NewLogger().Child("warehouse").Child("identity")
@@ -32,7 +30,7 @@ type WarehouseManager interface {
 }
 
 type HandleT struct {
-	Warehouse        warehouseutils.WarehouseT
+	Warehouse        warehouseutils.Warehouse
 	DbHandle         *sql.DB
 	Uploader         warehouseutils.UploaderI
 	UploadID         int64
@@ -78,9 +76,7 @@ func (idr *HandleT) applyRule(txn *sql.Tx, ruleID int64, gzWriter *misc.GZipWrit
 	}
 
 	currentTimeString := time.Now().Format(misc.RFC3339Milli)
-	var buff bytes.Buffer
-	csvWriter := csv.NewWriter(&buff)
-	var csvRows [][]string
+	var rows [][]string
 
 	// if no rudder_id is found with properties in merge_rule, create a new one
 	// else if only one rudder_id is found with properties in merge_rule, use that rudder_id
@@ -89,18 +85,18 @@ func (idr *HandleT) applyRule(txn *sql.Tx, ruleID int64, gzWriter *misc.GZipWrit
 		// generate new one and assign to these two
 		var rudderID string
 		if len(rudderIDs) == 0 {
-			rudderID = uuid.NewV4().String()
+			rudderID = misc.FastUUID().String()
 		} else {
 			rudderID = rudderIDs[0]
 		}
 		row1 := []string{prop1Type.String, prop1Val.String, rudderID, currentTimeString}
-		csvRows = append(csvRows, row1)
+		rows = append(rows, row1)
 		row1Values := misc.SingleQuoteLiteralJoin(row1)
 
 		var row2Values string
 		if prop2Val.Valid && prop2Type.Valid {
 			row2 := []string{prop2Type.String, prop2Val.String, rudderID, currentTimeString}
-			csvRows = append(csvRows, row2)
+			rows = append(rows, row2)
 			row2Values = fmt.Sprintf(`, (%s)`, misc.SingleQuoteLiteralJoin(row2))
 		}
 
@@ -113,43 +109,45 @@ func (idr *HandleT) applyRule(txn *sql.Tx, ruleID int64, gzWriter *misc.GZipWrit
 		}
 	} else {
 		// generate new one and update all
-		newID := uuid.NewV4().String()
+		newID := rudderIDs[0]
 		row1 := []string{prop1Type.String, prop1Val.String, newID, currentTimeString}
-		csvRows = append(csvRows, row1)
+		rows = append(rows, row1)
 		row1Values := misc.SingleQuoteLiteralJoin(row1)
 
 		var row2Values string
 		if prop2Val.Valid && prop2Type.Valid {
 			row2 := []string{prop2Type.String, prop2Val.String, newID, currentTimeString}
-			csvRows = append(csvRows, row2)
+			rows = append(rows, row2)
 			row2Values = fmt.Sprintf(`, (%s)`, misc.SingleQuoteLiteralJoin(row2))
 		}
 
 		quotedRudderIDs := misc.SingleQuoteLiteralJoin(rudderIDs)
 		sqlStatement := fmt.Sprintf(`SELECT merge_property_type, merge_property_value FROM %s WHERE rudder_id IN (%v)`, idr.mappingsTable(), quotedRudderIDs)
 		pkgLogger.Debugf(`IDR: Get all merge properties from mapping table with rudder_id's %v: %v`, quotedRudderIDs, sqlStatement)
-		var rows *sql.Rows
-		rows, err = txn.Query(sqlStatement)
+		var tableRows *sql.Rows
+		tableRows, err = txn.Query(sqlStatement)
 		if err != nil {
 			return
 		}
 
-		for rows.Next() {
+		for tableRows.Next() {
 			var mergePropType, mergePropVal string
-			err = rows.Scan(&mergePropType, &mergePropVal)
+			err = tableRows.Scan(&mergePropType, &mergePropVal)
 			if err != nil {
 				return
 			}
-			csvRow := []string{mergePropType, mergePropVal, newID, currentTimeString}
-			csvRows = append(csvRows, csvRow)
+			row := []string{mergePropType, mergePropVal, newID, currentTimeString}
+			rows = append(rows, row)
 		}
 
-		sqlStatement = fmt.Sprintf(`UPDATE %s SET rudder_id='%s', updated_at='%s' WHERE rudder_id IN (%v)`, idr.mappingsTable(), newID, currentTimeString, quotedRudderIDs)
-		pkgLogger.Debugf(`IDR: Update rudder_id for all properties in mapping table with rudder_id's %v: %v`, quotedRudderIDs, sqlStatement)
-		_, err = txn.Exec(sqlStatement)
+		sqlStatement = fmt.Sprintf(`UPDATE %s SET rudder_id='%s', updated_at='%s' WHERE rudder_id IN (%v)`, idr.mappingsTable(), newID, currentTimeString, misc.SingleQuoteLiteralJoin(rudderIDs[1:]))
+		var res sql.Result
+		res, err = txn.Exec(sqlStatement)
 		if err != nil {
 			return
 		}
+		affectedRowCount, _ := res.RowsAffected()
+		pkgLogger.Debugf(`IDR: Updated rudder_id for all properties in mapping table. Updated %v rows: %v `, affectedRowCount, sqlStatement)
 
 		sqlStatement = fmt.Sprintf(`INSERT INTO %s (merge_property_type, merge_property_value, rudder_id, updated_at) VALUES (%s) %s ON CONFLICT ON CONSTRAINT %s DO NOTHING`, idr.mappingsTable(), row1Values, row2Values, warehouseutils.IdentityMappingsUniqueMappingConstraintName(idr.Warehouse))
 		pkgLogger.Debugf(`IDR: Insert new mappings into %s: %v`, idr.mappingsTable(), sqlStatement)
@@ -158,19 +156,23 @@ func (idr *HandleT) applyRule(txn *sql.Tx, ruleID int64, gzWriter *misc.GZipWrit
 			return
 		}
 	}
-	for _, csvRow := range csvRows {
-		csvWriter.Write(csvRow)
+	columnNames := []string{"merge_property_type", "merge_property_value", "rudder_id", "updated_at"}
+	for _, row := range rows {
+		eventLoader := warehouseutils.GetNewEventLoader(idr.Warehouse.Type, idr.Uploader.GetLoadFileType(), gzWriter)
+		// TODO : support add row for parquet loader
+		eventLoader.AddRow(columnNames, row)
+		data, _ := eventLoader.WriteToString()
+		gzWriter.WriteGZ(data)
 	}
-	csvWriter.Flush()
-	gzWriter.WriteGZ(buff.String())
-	return len(csvRows), err
+
+	return len(rows), err
 }
 
 func (idr *HandleT) addRules(txn *sql.Tx, loadFileNames []string, gzWriter *misc.GZipWriter) (ids []int64, err error) {
 	// add rules from load files into temp table
 	// use original table to delete redundant ones from temp table
 	// insert from temp table into original table
-	mergeRulesStagingTable := fmt.Sprintf(`rudder_identity_merge_rules_staging_%s`, strings.Replace(uuid.NewV4().String(), "-", "", -1))
+	mergeRulesStagingTable := fmt.Sprintf(`rudder_identity_merge_rules_staging_%s`, warehouseutils.RandHex())
 	sqlStatement := fmt.Sprintf(`CREATE TEMP TABLE %s
 						ON COMMIT DROP
 						AS SELECT * FROM %s
@@ -191,11 +193,12 @@ func (idr *HandleT) addRules(txn *sql.Tx, loadFileNames []string, gzWriter *misc
 	}
 
 	var rowID int
+
 	for _, loadFileName := range loadFileNames {
 		var gzipFile *os.File
 		gzipFile, err = os.Open(loadFileName)
 		if err != nil {
-			pkgLogger.Errorf(`IDR: Error opeining downloaded load file at %s: %v`, loadFileName, err)
+			pkgLogger.Errorf(`IDR: Error opening downloaded load file at %s: %v`, loadFileName, err)
 			return
 		}
 		defer gzipFile.Close()
@@ -208,17 +211,17 @@ func (idr *HandleT) addRules(txn *sql.Tx, loadFileNames []string, gzWriter *misc
 		}
 		defer gzipReader.Close()
 
-		csvReader := csv.NewReader(gzipReader)
+		eventReader := warehouseutils.NewEventReader(gzipReader, idr.Warehouse.Type)
+		columnNames := []string{"merge_property_1_type", "merge_property_1_value", "merge_property_2_type", "merge_property_2_value"}
 		for {
 			var record []string
-			record, err = csvReader.Read()
+			record, err = eventReader.Read(columnNames)
 			if err != nil {
 				if err == io.EOF {
 					break
-				} else {
-					pkgLogger.Errorf("IDR: Error while reading csv file for loading in staging table locally:%s: %v", mergeRulesStagingTable, err)
-					return
 				}
+				pkgLogger.Errorf("IDR: Error while reading merge rule file %s for loading in staging table locally:%s: %v", loadFileName, mergeRulesStagingTable, err)
+				return
 			}
 			var recordInterface [5]interface{}
 			for idx, value := range record {
@@ -239,7 +242,7 @@ func (idr *HandleT) addRules(txn *sql.Tx, loadFileNames []string, gzWriter *misc
 
 	_, err = stmt.Exec()
 	if err != nil {
-		pkgLogger.Errorf(`IDR: Error bulk copy using CopyIn: %v`, err)
+		pkgLogger.Errorf(`IDR: Error bulk copy using CopyIn: %v for uploadID: %v`, err, idr.UploadID)
 		return
 	}
 
@@ -294,6 +297,7 @@ func (idr *HandleT) addRules(txn *sql.Tx, loadFileNames []string, gzWriter *misc
 		}
 		ids = append(ids, id)
 	}
+	pkgLogger.Debugf(`IDR: Number of merge rules inserted for uploadID %v : %v`, idr.UploadID, len(ids))
 	return ids, nil
 }
 
@@ -315,21 +319,27 @@ func (idr *HandleT) writeTableToFile(tableName string, txn *sql.Tx, gzWriter *mi
 		if err != nil {
 			return
 		}
-
+		columnNames := []string{"merge_property_1_type", "merge_property_1_value", "merge_property_2_type", "merge_property_2_value"}
 		for rows.Next() {
-			var buff bytes.Buffer
-			csvWriter := csv.NewWriter(&buff)
-			var csvRow []string
-
+			var rowData []string
+			eventLoader := warehouseutils.GetNewEventLoader(idr.Warehouse.Type, idr.Uploader.GetLoadFileType(), gzWriter)
 			var prop1Val, prop2Val, prop1Type, prop2Type sql.NullString
-			err = rows.Scan(&prop1Type, &prop1Val, &prop2Type, &prop2Val)
+			err = rows.Scan(
+				&prop1Type,
+				&prop1Val,
+				&prop2Type,
+				&prop2Val,
+			)
 			if err != nil {
 				return
 			}
-			csvRow = append(csvRow, prop1Type.String, prop1Val.String, prop2Type.String, prop2Val.String)
-			csvWriter.Write(csvRow)
-			csvWriter.Flush()
-			gzWriter.WriteGZ(buff.String())
+			rowData = append(rowData, prop1Type.String, prop1Val.String, prop2Type.String, prop2Val.String)
+			for i, columnName := range columnNames {
+				// TODO : use proper column type here
+				eventLoader.AddColumn(columnName, "", rowData[i])
+			}
+			rowString, _ := eventLoader.WriteToString()
+			gzWriter.WriteGZ(rowString)
 		}
 
 		offset += batchSize
@@ -341,47 +351,53 @@ func (idr *HandleT) writeTableToFile(tableName string, txn *sql.Tx, gzWriter *mi
 }
 
 func (idr *HandleT) downloadLoadFiles(tableName string) ([]string, error) {
-	objectLocations := idr.Uploader.GetLoadFileLocations(warehouseutils.GetLoadFileLocationsOptionsT{Table: tableName})
+	objects := idr.Uploader.GetLoadFilesMetadata(warehouseutils.GetLoadFilesOptionsT{Table: tableName})
 	var fileNames []string
-	for _, objectLocation := range objectLocations {
-		objectName, err := warehouseutils.GetObjectName(objectLocation, idr.Warehouse.Destination.Config, warehouseutils.ObjectStorageType(idr.Warehouse.Destination.DestinationDefinition.Name, idr.Warehouse.Destination.Config))
+	for _, object := range objects {
+		objectName, err := warehouseutils.GetObjectName(object.Location, idr.Warehouse.Destination.Config, warehouseutils.ObjectStorageType(idr.Warehouse.Destination.DestinationDefinition.Name, idr.Warehouse.Destination.Config, idr.Uploader.UseRudderStorage()))
 		if err != nil {
-			pkgLogger.Errorf("IDR: Error in converting object location to object key for table:%s: %s,%v", tableName, objectLocation, err)
+			pkgLogger.Errorf("IDR: Error in converting object location to object key for table:%s: %s,%v", tableName, object.Location, err)
 			return nil, err
 		}
-		dirName := "/rudder-warehouse-load-uploads-tmp/"
+		dirName := fmt.Sprintf(`/%s/`, misc.RudderWarehouseLoadUploadsTmp)
 		tmpDirPath, err := misc.CreateTMPDIR()
 		if err != nil {
-			pkgLogger.Errorf("IDR: Error in creating tmp directory for downloading load file for table:%s: %s, %v", tableName, objectLocation, err)
+			pkgLogger.Errorf("IDR: Error in creating tmp directory for downloading load file for table:%s: %s, %v", tableName, object.Location, err)
 			return nil, err
 		}
 		objectPath := tmpDirPath + dirName + fmt.Sprintf(`%s_%s_%d/`, idr.Warehouse.Destination.DestinationDefinition.Name, idr.Warehouse.Destination.ID, time.Now().Unix()) + objectName
 		err = os.MkdirAll(filepath.Dir(objectPath), os.ModePerm)
 		if err != nil {
-			pkgLogger.Errorf("IDR: Error in making tmp directory for downloading load file for table:%s: %s, %s %v", tableName, objectLocation, err)
+			pkgLogger.Errorf("IDR: Error in making tmp directory for downloading load file for table:%s: %s, %s %v", tableName, object.Location, err)
 			return nil, err
 		}
 		objectFile, err := os.Create(objectPath)
 		if err != nil {
-			pkgLogger.Errorf("IDR: Error in creating file in tmp directory for downloading load file for table:%s: %s, %v", tableName, objectLocation, err)
+			pkgLogger.Errorf("IDR: Error in creating file in tmp directory for downloading load file for table:%s: %s, %v", tableName, object.Location, err)
 			return nil, err
 		}
-		downloader, err := filemanager.New(&filemanager.SettingsT{
-			Provider: warehouseutils.ObjectStorageType(idr.Warehouse.Destination.DestinationDefinition.Name, idr.Warehouse.Destination.Config),
-			Config:   idr.Warehouse.Destination.Config,
+		storageProvider := warehouseutils.ObjectStorageType(idr.Warehouse.Destination.DestinationDefinition.Name, idr.Warehouse.Destination.Config, idr.Uploader.UseRudderStorage())
+		downloader, err := filemanager.DefaultFileManagerFactory.New(&filemanager.SettingsT{
+			Provider: storageProvider,
+			Config: misc.GetObjectStorageConfig(misc.ObjectStorageOptsT{
+				Provider:         storageProvider,
+				Config:           idr.Warehouse.Destination.Config,
+				UseRudderStorage: idr.Uploader.UseRudderStorage(),
+				WorkspaceID:      idr.Warehouse.Destination.WorkspaceID,
+			}),
 		})
 		if err != nil {
 			pkgLogger.Errorf("IDR: Error in creating a file manager for :%s: , %v", idr.Warehouse.Destination.DestinationDefinition.Name, err)
 			return nil, err
 		}
-		err = downloader.Download(objectFile, objectName)
+		err = downloader.Download(context.TODO(), objectFile, objectName)
 		if err != nil {
-			pkgLogger.Errorf("IDR: Error in downloading file in tmp directory for downloading load file for table:%s: %s, %v", tableName, objectLocation, err)
+			pkgLogger.Errorf("IDR: Error in downloading file in tmp directory for downloading load file for table:%s: %s, %v", tableName, object.Location, err)
 			return nil, err
 		}
 		fileName := objectFile.Name()
 		if err = objectFile.Close(); err != nil {
-			pkgLogger.Errorf("IDR: Error in closing downloaded file in tmp directory for downloading load file for table:%s: %s, %v", tableName, objectLocation, err)
+			pkgLogger.Errorf("IDR: Error in closing downloaded file in tmp directory for downloading load file for table:%s: %s, %v", tableName, object.Location, err)
 			return nil, err
 		}
 		fileNames = append(fileNames, fileName)
@@ -394,15 +410,20 @@ func (idr *HandleT) uploadFile(filePath string, txn *sql.Tx, tableName string, t
 	if err != nil {
 		panic(err)
 	}
-	uploader, err := filemanager.New(&filemanager.SettingsT{
-		Provider: warehouseutils.ObjectStorageType(idr.Warehouse.Destination.DestinationDefinition.Name, idr.Warehouse.Destination.Config),
-		Config:   idr.Warehouse.Destination.Config,
+	storageProvider := warehouseutils.ObjectStorageType(idr.Warehouse.Destination.DestinationDefinition.Name, idr.Warehouse.Destination.Config, idr.Uploader.UseRudderStorage())
+	uploader, err := filemanager.DefaultFileManagerFactory.New(&filemanager.SettingsT{
+		Provider: storageProvider,
+		Config: misc.GetObjectStorageConfig(misc.ObjectStorageOptsT{
+			Provider:         storageProvider,
+			Config:           idr.Warehouse.Destination.Config,
+			UseRudderStorage: idr.Uploader.UseRudderStorage(),
+		}),
 	})
 	if err != nil {
 		pkgLogger.Errorf("IDR: Error in creating a file manager for :%s: , %v", idr.Warehouse.Destination.DestinationDefinition.Name, err)
 		return err
 	}
-	output, err := uploader.Upload(outputFile, config.GetEnv("WAREHOUSE_BUCKET_LOAD_OBJECTS_FOLDER_NAME", "rudder-warehouse-load-objects"), tableName, idr.Warehouse.Source.ID, tableName)
+	output, err := uploader.Upload(context.TODO(), outputFile, config.GetString("WAREHOUSE_BUCKET_LOAD_OBJECTS_FOLDER_NAME", "rudder-warehouse-load-objects"), tableName, idr.Warehouse.Source.ID, tableName)
 	if err != nil {
 		return
 	}
@@ -421,7 +442,8 @@ func (idr *HandleT) createTempGzFile(dirName string) (gzWriter misc.GZipWriter, 
 	if err != nil {
 		panic(err)
 	}
-	path = tmpDirPath + dirName + fmt.Sprintf(`%s_%s/%v/`, idr.Warehouse.Destination.DestinationDefinition.Name, idr.Warehouse.Destination.ID, idr.UploadID) + uuid.NewV4().String() + ".csv.gz"
+	fileExtension := warehouseutils.GetTempFileExtension(idr.Warehouse.Type)
+	path = tmpDirPath + dirName + fmt.Sprintf(`%s_%s/%v/`, idr.Warehouse.Destination.DestinationDefinition.Name, idr.Warehouse.Destination.ID, idr.UploadID) + misc.FastUUID().String() + "." + fileExtension
 	err = os.MkdirAll(filepath.Dir(path), os.ModePerm)
 	if err != nil {
 		panic(err)
@@ -434,15 +456,14 @@ func (idr *HandleT) createTempGzFile(dirName string) (gzWriter misc.GZipWriter, 
 }
 
 func (idr *HandleT) processMergeRules(fileNames []string) (err error) {
-
 	txn, err := idr.DbHandle.Begin()
 	if err != nil {
 		panic(err)
 	}
 
 	// START: Add new merge rules to local pg table and also to file
-	mergeRulesFileGzWriter, mergeRulesFilePath := idr.createTempGzFile(`/rudder-identity-merge-rules-tmp/`)
-	defer os.Remove(mergeRulesFilePath)
+	mergeRulesFileGzWriter, mergeRulesFilePath := idr.createTempGzFile(fmt.Sprintf(`/%s/`, misc.RudderIdentityMergeRulesTmp))
+	defer misc.RemoveFilePaths(mergeRulesFilePath)
 
 	ruleIDs, err := idr.addRules(txn, fileNames, &mergeRulesFileGzWriter)
 	if err != nil {
@@ -454,8 +475,8 @@ func (idr *HandleT) processMergeRules(fileNames []string) (err error) {
 	// END: Add new merge rules to local pg table and also to file
 
 	// START: Add new/changed identity mappings to local pg table and also to file
-	mappingsFileGzWriter, mappingsFilePath := idr.createTempGzFile(`/rudder-identity-mappings-tmp/`)
-	defer os.Remove(mappingsFilePath)
+	mappingsFileGzWriter, mappingsFilePath := idr.createTempGzFile(fmt.Sprintf(`/%s/`, misc.RudderIdentityMappingsTmp))
+	defer misc.RemoveFilePaths(mappingsFilePath)
 	var totalMappingRecords int
 	for idx, ruleID := range ruleIDs {
 		var count int
@@ -466,7 +487,7 @@ func (idr *HandleT) processMergeRules(fileNames []string) (err error) {
 		}
 		totalMappingRecords += count
 		if idx%1000 == 0 {
-			pkgLogger.Infof(`IDR: Applied %d rules out of %d. Total Mapping records added: %d. Namepsace: %s, Destination: %s:%s`, idx+1, len(ruleIDs), totalMappingRecords, idr.Warehouse.Namespace, idr.Warehouse.Type, idr.Warehouse.Destination.ID)
+			pkgLogger.Infof(`IDR: Applied %d rules out of %d. Total Mapping records added: %d. Namespace: %s, Destination: %s:%s`, idx+1, len(ruleIDs), totalMappingRecords, idr.Warehouse.Namespace, idr.Warehouse.Type, idr.Warehouse.Destination.ID)
 		}
 	}
 	mappingsFileGzWriter.CloseGZ()
@@ -488,7 +509,7 @@ func (idr *HandleT) processMergeRules(fileNames []string) (err error) {
 
 	err = txn.Commit()
 	if err != nil {
-		pkgLogger.Errorf(`IDR: Error commiting transaction: %v`, err)
+		pkgLogger.Errorf(`IDR: Error committing transaction: %v`, err)
 		return
 	}
 	return
@@ -500,7 +521,6 @@ func (idr *HandleT) processMergeRules(fileNames []string) (err error) {
 // 3. Apply each merge rule and update local identity mapping table
 // 4. Upload the diff of each table to load files for both tables
 func (idr *HandleT) Resolve() (err error) {
-
 	var loadFileNames []string
 	defer misc.RemoveFilePaths(loadFileNames...)
 	loadFileNames, err = idr.downloadLoadFiles(idr.whMergeRulesTable())
@@ -515,14 +535,14 @@ func (idr *HandleT) Resolve() (err error) {
 func (idr *HandleT) ResolveHistoricIdentities() (err error) {
 	var loadFileNames []string
 	defer misc.RemoveFilePaths(loadFileNames...)
-	csvGzWriter, csvPath := idr.createTempGzFile(`/rudder-identity-merge-rules-tmp/`)
-	err = idr.WarehouseManager.DownloadIdentityRules(&csvGzWriter)
-	csvGzWriter.CloseGZ()
+	gzWriter, path := idr.createTempGzFile(fmt.Sprintf(`/%s/`, misc.RudderIdentityMergeRulesTmp))
+	err = idr.WarehouseManager.DownloadIdentityRules(&gzWriter)
+	gzWriter.CloseGZ()
 	if err != nil {
 		pkgLogger.Errorf(`IDR: Failed to download identity information from warehouse with error: %v`, err)
 		return
 	}
-	loadFileNames = append(loadFileNames, csvPath)
+	loadFileNames = append(loadFileNames, path)
 
 	return idr.processMergeRules(loadFileNames)
 }

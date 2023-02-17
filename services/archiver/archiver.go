@@ -1,6 +1,7 @@
 package archiver
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -16,21 +17,19 @@ import (
 
 var (
 	backupRowsBatchSize int
-	pkgLogger           logger.LoggerI
+	pkgLogger           logger.Logger
 )
 
-func init() {
-	backupRowsBatchSize = config.GetInt("Archiver.backupRowsBatchSize", 100)
+func Init() {
+	loadConfig()
 	pkgLogger = logger.NewLogger().Child("archiver")
 }
 
-func isArchiverObjectStorageConfigured() bool {
-	provider := config.GetEnv("JOBS_BACKUP_STORAGE_PROVIDER", "")
-	bucket := config.GetEnv("JOBS_BACKUP_BUCKET", "")
-	return provider != "" && bucket != ""
+func loadConfig() {
+	config.RegisterIntConfigVariable(100, &backupRowsBatchSize, true, 1, "Archiver.backupRowsBatchSize")
 }
 
-//ArchiveOldRecords archives records in the table with the name`tableName` and `tsColumn` provided is used as the timestamp column.
+// ArchiveOldRecords archives records in the table with the name`tableName` and `tsColumn` provided is used as the timestamp column.
 func ArchiveOldRecords(tableName, tsColumn string, archivalTimeInDays int, dbHandle *sql.DB) {
 	stmt := fmt.Sprintf(`SELECT count(*), COALESCE(MIN(id),0), COALESCE(MAX(id),0) FROM %s WHERE %s < NOW() -INTERVAL '%d DAY'`, tableName, tsColumn, archivalTimeInDays)
 	pkgLogger.Info(stmt)
@@ -46,24 +45,12 @@ func ArchiveOldRecords(tableName, tsColumn string, archivalTimeInDays int, dbHan
 		return
 	}
 
-	// TODO: Should we skip deletion if object storage provider not configured?
-	if !isArchiverObjectStorageConfigured() {
-		stmt = fmt.Sprintf(`DELETE FROM  %s WHERE id >= %d and id <= %d`, tableName, minID, maxID)
-		_, err = dbHandle.Exec(stmt)
-		if err != nil {
-			pkgLogger.Errorf(`[Archiver]: Error in deleting %s records: %v`, tableName, err)
-			return
-		}
-		pkgLogger.Infof(`[Archiver]: Deleted %s records %d to %d. No object storage was configured for archival`, tableName, minID, maxID)
-		return
-	}
-
 	tmpDirPath, err := misc.CreateTMPDIR()
 	if err != nil {
 		pkgLogger.Errorf("[Archiver]: Failed to create tmp DIR")
 		return
 	}
-	backupPathDirName := "/rudder-archives/"
+	backupPathDirName := fmt.Sprintf(`/%s/`, misc.RudderArchives)
 	pathPrefix := strcase.ToKebab(tableName)
 
 	path := fmt.Sprintf(`%v%v.%v.%v.%v.json.gz`,
@@ -75,12 +62,12 @@ func ArchiveOldRecords(tableName, tsColumn string, archivalTimeInDays int, dbHan
 	)
 	defer os.Remove(path)
 
-	fManager, err := filemanager.New(&filemanager.SettingsT{
-		Provider: config.GetEnv("JOBS_BACKUP_STORAGE_PROVIDER", "S3"),
-		Config:   filemanager.GetProviderConfigFromEnv(),
+	fManager, err := filemanager.DefaultFileManagerFactory.New(&filemanager.SettingsT{
+		Provider: config.GetString("JOBS_BACKUP_STORAGE_PROVIDER", "S3"),
+		Config:   filemanager.GetProviderConfigForBackupsFromEnv(context.TODO()),
 	})
 	if err != nil {
-		pkgLogger.Errorf("[Archiver]: Error in creating a file manager for :%s: , %v", config.GetEnv("JOBS_BACKUP_STORAGE_PROVIDER", "S3"), err)
+		pkgLogger.Errorf("[Archiver]: Error in creating a file manager for :%s: , %v", config.GetString("JOBS_BACKUP_STORAGE_PROVIDER", "S3"), err)
 	}
 
 	tableJSONArchiver := tablearchiver.TableJSONArchiver{
@@ -92,7 +79,6 @@ func ArchiveOldRecords(tableName, tsColumn string, archivalTimeInDays int, dbHan
 	}
 
 	storedLocation, err := tableJSONArchiver.Do()
-
 	if err != nil {
 		pkgLogger.Errorf(`[Archiver]: Error archiving table %s: %v`, tableName, err)
 		return

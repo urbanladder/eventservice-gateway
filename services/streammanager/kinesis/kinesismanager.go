@@ -1,74 +1,59 @@
+//go:generate mockgen -destination=../../../mocks/services/streammanager/kinesis/mock_kinesis.go -package mock_kinesis github.com/rudderlabs/rudder-server/services/streammanager/kinesis KinesisClient
+
 package kinesis
 
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/kinesis"
-	"github.com/rudderlabs/rudder-server/utils/logger"
 	"github.com/tidwall/gjson"
+
+	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
+	"github.com/rudderlabs/rudder-server/services/streammanager/common"
+	"github.com/rudderlabs/rudder-server/utils/awsutils"
+	"github.com/rudderlabs/rudder-server/utils/logger"
 )
 
-var abortableErrors = []string{}
-var pkgLogger logger.LoggerI
+var pkgLogger logger.Logger
 
 // Config is the config that is required to send data to Kinesis
 type Config struct {
-	Region       string
 	Stream       string
-	AccessKeyID  string
-	AccessKey    string
 	UseMessageID bool
 }
 
 func init() {
-	abortableErrors = []string{"AccessDeniedException", "IncompleteSignature", "InvalidAction", "InvalidClientTokenId", "InvalidParameterCombination",
-		"InvalidParameterValue", "InvalidQueryParameter", "MissingAuthenticationToken", "MissingParameter", "InvalidArgumentException",
-		"KMSAccessDeniedException", "KMSDisabledException", "KMSInvalidStateException", "KMSNotFoundException", "KMSOptInRequired",
-		"ResourceNotFoundException", "UnrecognizedClientException", "ValidationError"}
+	pkgLogger = logger.NewLogger().Child("streammanager").Child(kinesis.ServiceName)
+}
 
-	pkgLogger = logger.NewLogger().Child("streammanager").Child("kinesis")
+type KinesisProducer struct {
+	client KinesisClient
+}
+
+type KinesisClient interface {
+	PutRecord(input *kinesis.PutRecordInput) (*kinesis.PutRecordOutput, error)
 }
 
 // NewProducer creates a producer based on destination config
-func NewProducer(destinationConfig interface{}) (kinesis.Kinesis, error) {
-	config := Config{}
-
-	jsonConfig, err := json.Marshal(destinationConfig)
+func NewProducer(destination *backendconfig.DestinationT, o common.Opts) (*KinesisProducer, error) {
+	sessionConfig, err := awsutils.NewSessionConfigForDestination(destination, o.Timeout, kinesis.ServiceName)
 	if err != nil {
-		return kinesis.Kinesis{}, fmt.Errorf("[KinesisManager] Error while marshalling destination config %+v. Error: %w", destinationConfig, err)
+		return nil, err
 	}
-	err = json.Unmarshal(jsonConfig, &config)
+	awsSession, err := awsutils.CreateSession(sessionConfig)
 	if err != nil {
-		return kinesis.Kinesis{}, fmt.Errorf("[KinesisManager] Error while unmarshalling destination config. Error: %w", err)
+		return nil, err
 	}
-
-	var s *session.Session
-	if config.AccessKeyID == "" || config.AccessKey == "" {
-		s = session.Must(session.NewSession(&aws.Config{
-			Region: aws.String(config.Region),
-		}))
-	} else {
-		s = session.Must(session.NewSession(&aws.Config{
-			Region:      aws.String(config.Region),
-			Credentials: credentials.NewStaticCredentials(config.AccessKeyID, config.AccessKey, "")}))
-	}
-	var kc *kinesis.Kinesis = kinesis.New(s)
-	return *kc, err
+	return &KinesisProducer{client: kinesis.New(awsSession)}, err
 }
 
 // Produce creates a producer and send data to Kinesis.
-func Produce(jsonData json.RawMessage, producer interface{}, destConfig interface{}) (int, string, string) {
-
-	parsedJSON := gjson.ParseBytes(jsonData)
-
-	kc, ok := producer.(kinesis.Kinesis)
-	if !ok {
-		return 400, "Could not create producer", "Could not create producer"
+func (producer *KinesisProducer) Produce(jsonData json.RawMessage, destConfig interface{}) (int, string, string) {
+	client := producer.client
+	if client == nil {
+		return 400, "Could not create producer for Kinesis", "Could not create producer for Kinesis"
 	}
 
 	config := Config{}
@@ -76,60 +61,53 @@ func Produce(jsonData json.RawMessage, producer interface{}, destConfig interfac
 	jsonConfig, err := json.Marshal(destConfig)
 	if err != nil {
 		outErr := fmt.Errorf("[KinesisManager] Error while Marshalling destination config %+v Error: %w", destConfig, err)
-		return GetStatusCodeFromError(err), outErr.Error(), outErr.Error()
+		return 400, outErr.Error(), outErr.Error()
 	}
 	err = json.Unmarshal(jsonConfig, &config)
 	if err != nil {
 		outErr := fmt.Errorf("[KinesisManager] Error while Unmarshalling destination config: %w", err)
-		return GetStatusCodeFromError(err), outErr.Error(), outErr.Error()
+		return 400, outErr.Error(), outErr.Error()
 	}
 
 	streamName := aws.String(config.Stream)
-
-	data := parsedJSON.Get("message").Value().(interface{})
+	parsedJSON := gjson.ParseBytes(jsonData)
+	data := parsedJSON.Get("message").Value()
+	if data == nil {
+		return 400, "InvalidPayload", "Empty Payload"
+	}
 	value, err := json.Marshal(data)
 	if err != nil {
-		return GetStatusCodeFromError(err), err.Error(), err.Error()
-	}
-	var userID string
-	if userID, ok = parsedJSON.Get("userId").Value().(string); !ok {
-		userID = fmt.Sprintf("%v", parsedJSON.Get("userId").Value())
+		return 400, err.Error(), err.Error()
 	}
 
-	partitionKey := aws.String(userID)
+	var partitionKey string
 
 	if config.UseMessageID {
-		messageID := parsedJSON.Get("message").Get("messageId").Value().(string)
-		partitionKey = aws.String(messageID)
+		partitionKey = parsedJSON.Get("message.messageId").String()
 	}
 
-	putOutput, err := kc.PutRecord(&kinesis.PutRecordInput{
-		Data:         []byte(value),
+	if partitionKey == "" {
+		partitionKey = parsedJSON.Get("userId").String()
+	}
+	putInput := kinesis.PutRecordInput{
+		Data:         value,
 		StreamName:   streamName,
-		PartitionKey: partitionKey,
-	})
+		PartitionKey: aws.String(partitionKey),
+	}
+	if err = putInput.Validate(); err != nil {
+		return 400, "InvalidInput", err.Error()
+	}
+	putOutput, err := client.PutRecord(&putInput)
 	if err != nil {
-		pkgLogger.Errorf("error in kinesis :: %v", err.Error())
-		statusCode := GetStatusCodeFromError(err)
-
-		return statusCode, err.Error(), err.Error()
+		statusCode, respStatus, responseMessage := common.ParseAWSError(err)
+		pkgLogger.Errorf("[Kinesis] error  :: %d : %s : %s", statusCode, respStatus, responseMessage)
+		return statusCode, respStatus, responseMessage
 	}
 	message := fmt.Sprintf("Message delivered at SequenceNumber: %v , shard Id: %v", putOutput.SequenceNumber, putOutput.ShardId)
 	return 200, "Success", message
 }
 
-// GetStatusCodeFromError parses the error and returns the status so that event gets retried or failed.
-func GetStatusCodeFromError(err error) int {
-	statusCode := 500
-
-	errorString := err.Error()
-
-	for _, s := range abortableErrors {
-		if strings.Contains(errorString, s) {
-			statusCode = 400
-			break
-		}
-	}
-
-	return statusCode
+func (*KinesisProducer) Close() error {
+	// no-op
+	return nil
 }

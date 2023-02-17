@@ -19,8 +19,8 @@ var prefix = "gw_jobs_"
 func (g *GatewayAdmin) Status() interface{} {
 	configSubscriberLock.RLock()
 	defer configSubscriberLock.RUnlock()
-	writeKeys := make([]string, 0, len(enabledWriteKeysSourceMap))
-	for k := range enabledWriteKeysSourceMap {
+	writeKeys := make([]string, 0, len(writeKeysSourceMap))
+	for k := range writeKeysSourceMap {
 		writeKeys = append(writeKeys, k)
 	}
 
@@ -30,7 +30,6 @@ func (g *GatewayAdmin) Status() interface{} {
 		"enabled-write-keys": writeKeys,
 		"jobsdb":             g.handle.jobsDB.Status(),
 	}
-
 }
 
 type GatewayRPCHandler struct {
@@ -58,7 +57,7 @@ func (r *SqlRunner) getUniqueSources() ([]SourceEvents, error) {
 	if err != nil {
 		return sources, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	sourceEvent := SourceEvents{}
 	for rows.Next() {
 		err = rows.Scan(&sourceEvent.Count, &sourceEvent.ID)
@@ -119,7 +118,7 @@ type DSStats struct {
 	NumRows      int
 }
 
-// TODO :
+// GetDSStats TODO :
 // first_event, last_event min--maxid to event: available in dsrange
 // Average batch size ⇒ num_events we want per ds
 // writeKey, count(*)  we want source name to count per ds
@@ -141,21 +140,21 @@ AvgBatchSize :  1
 TableSize :  65536
 NumRows :  8
 */
-func (g *GatewayRPCHandler) GetDSStats(dsName string, result *string) (err error) {
+func (*GatewayRPCHandler) GetDSStats(dsName string, result *string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			pkgLogger.Error(r)
-			err = fmt.Errorf("Internal Rudder Server Error. Error: %w", r)
+			err = fmt.Errorf("internal Rudder server error: %v", r)
 		}
 	}()
 
 	var completeErr error
 	jobTableName := prefix + dsName
-	dbHandle, err := sql.Open("postgres", jobsdb.GetConnectionString())
+	dbHandle, err := sql.Open("postgres", misc.GetConnectionString())
 	if err != nil {
 		return err
 	}
-	defer dbHandle.Close() // since this also returns an error, we can explicitly close but not doing
+	defer func() { _ = dbHandle.Close() }() // since this also returns an error, we can explicitly close but not doing
 	runner := &SqlRunner{dbHandle: dbHandle, jobTableName: jobTableName}
 	sources, err := runner.getUniqueSources()
 	if err != nil {
@@ -198,15 +197,15 @@ func (g *GatewayRPCHandler) GetDSStats(dsName string, result *string) (err error
 	return completeErr
 }
 
-func (g *GatewayRPCHandler) GetDSList(emptyInput string, result *string) (err error) {
+func (g *GatewayRPCHandler) GetDSList(_ string, result *string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			pkgLogger.Error(r)
-			err = fmt.Errorf("Internal Rudder Server Error. Error: %w", r)
+			err = fmt.Errorf("internal Rudder server error: %v", r)
 		}
 	}()
 	response, err := g.readOnlyJobsDB.GetDSListString()
-	*result = string(response)
+	*result = response
 	return nil
 }
 
@@ -214,11 +213,11 @@ func (g *GatewayRPCHandler) GetDSJobCount(arg string, result *string) (err error
 	defer func() {
 		if r := recover(); r != nil {
 			pkgLogger.Error(r)
-			err = fmt.Errorf("Internal Rudder Server Error. Error: %w", r)
+			err = fmt.Errorf("internal Rudder server error: %v", r)
 		}
 	}()
 	response, err := g.readOnlyJobsDB.GetJobSummaryCount(arg, prefix)
-	*result = string(response)
+	*result = response
 	return err
 }
 
@@ -226,11 +225,11 @@ func (g *GatewayRPCHandler) GetDSFailedJobs(arg string, result *string) (err err
 	defer func() {
 		if r := recover(); r != nil {
 			pkgLogger.Error(r)
-			err = fmt.Errorf("Internal Rudder Server Error. Error: %w", r)
+			err = fmt.Errorf("internal Rudder server error: %v", r)
 		}
 	}()
 	response, err := g.readOnlyJobsDB.GetLatestFailedJobs(arg, prefix)
-	*result = string(response)
+	*result = response
 	return err
 }
 
@@ -238,11 +237,11 @@ func (g *GatewayRPCHandler) GetJobByID(arg string, result *string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			pkgLogger.Error(r)
-			err = fmt.Errorf("Internal Rudder Server Error. Error: %w", r)
+			err = fmt.Errorf("internal Rudder server error: %v", r)
 		}
 	}()
 	response, err := g.readOnlyJobsDB.GetJobByID(arg, prefix)
-	*result = string(response)
+	*result = response
 	return err
 }
 
@@ -250,17 +249,17 @@ func (g *GatewayRPCHandler) GetJobIDStatus(arg string, result *string) (err erro
 	defer func() {
 		if r := recover(); r != nil {
 			pkgLogger.Error(r)
-			err = fmt.Errorf("Internal Rudder Server Error. Error: %w", r)
+			err = fmt.Errorf("internal Rudder server error: %v", r)
 		}
 	}()
 	response, err := g.readOnlyJobsDB.GetJobIDStatus(arg, prefix)
-	*result = string(response)
+	*result = response
 	return err
 }
 
-func runSQL(runner *SqlRunner, query string, reciever interface{}) error {
+func runSQL(runner *SqlRunner, query string, receiver interface{}) error {
 	row := runner.dbHandle.QueryRow(query)
-	err := row.Scan(reciever)
+	err := row.Scan(receiver)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil //"Zero rows found"

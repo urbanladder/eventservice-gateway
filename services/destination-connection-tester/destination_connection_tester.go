@@ -2,6 +2,7 @@ package destination_connection_tester
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,15 +10,14 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/rudderlabs/rudder-server/warehouse/manager"
-	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
+	"github.com/google/uuid"
 
 	"github.com/rudderlabs/rudder-server/config"
 	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
 	"github.com/rudderlabs/rudder-server/services/filemanager"
+	"github.com/rudderlabs/rudder-server/utils/httputil"
 	"github.com/rudderlabs/rudder-server/utils/logger"
 	"github.com/rudderlabs/rudder-server/utils/misc"
-	uuid "github.com/satori/go.uuid"
 )
 
 var (
@@ -26,11 +26,13 @@ var (
 	retrySleep                    time.Duration
 	instanceID                    string
 	rudderConnectionTestingFolder string
-	pkgLogger                     logger.LoggerI
+	pkgLogger                     logger.Logger
 )
 
-const destinationConnectionTesterEndpoint = "dataplane/testConnectionResponse"
-const testPayload = "ok"
+const (
+	destinationConnectionTesterEndpoint = "dataplane/testConnectionResponse"
+	testPayload                         = "ok"
+)
 
 type DestinationConnectionTesterResponse struct {
 	DestinationId string    `json:"destinationId"`
@@ -39,21 +41,20 @@ type DestinationConnectionTesterResponse struct {
 	TestedAt      time.Time `json:"testedAt"`
 }
 
-func init() {
+func Init() {
 	loadConfig()
 	pkgLogger = logger.NewLogger().Child("destination-connection-tester")
 }
 
 func loadConfig() {
-	configBackendURL = config.GetEnv("CONFIG_BACKEND_URL", "https://api.rudderstack.com")
+	configBackendURL = config.GetString("CONFIG_BACKEND_URL", "https://api.rudderstack.com")
 	maxRetry = config.GetInt("DestinationConnectionTester.maxRetry", 3)
-	retrySleep = config.GetDuration("DestinationConnectionTester.retrySleepInMS", time.Duration(100)) * time.Millisecond
-	instanceID = config.GetEnv("INSTANCE_ID", "1")
-	rudderConnectionTestingFolder = config.GetEnv("RUDDER_CONNECTION_TESTING_BUCKET_FOLDER_NAME", "rudder-test-payload")
-
+	config.RegisterDurationConfigVariable(100, &retrySleep, false, time.Millisecond, []string{"DestinationConnectionTester.retrySleep", "DestinationConnectionTester.retrySleepInMS"}...)
+	instanceID = config.GetString("INSTANCE_ID", "1")
+	rudderConnectionTestingFolder = config.GetString("RUDDER_CONNECTION_TESTING_BUCKET_FOLDER_NAME", misc.RudderTestPayload)
 }
 
-func UploadDestinationConnectionTesterResponse(testResponse string, destinationId string) {
+func UploadDestinationConnectionTesterResponse(testResponse, destinationId string) {
 	payload := DestinationConnectionTesterResponse{
 		Error:         testResponse,
 		TestedAt:      time.Now(),
@@ -69,18 +70,17 @@ func UploadDestinationConnectionTesterResponse(testResponse string, destinationI
 func makePostRequest(url string, payload interface{}) error {
 	rawJSON, err := json.Marshal(payload)
 	if err != nil {
-		pkgLogger.Debugf(string(rawJSON))
-		misc.AssertErrorIfDev(err)
+		pkgLogger.Errorf("[Destination Connection Tester] Failed to marshal payload. Err: %v", err)
 		return err
 	}
-	client := &http.Client{}
+	client := &http.Client{Timeout: config.GetDuration("HttpClient.dct.timeout", 30, time.Second)}
 	retryCount := 0
 	var resp *http.Response
-	//Sending destination connection test response to Config Backend
+	// Sending destination connection test response to Config Backend
 	for {
 		req, err := http.NewRequest("POST", url, bytes.NewBuffer(rawJSON))
 		if err != nil {
-			misc.AssertErrorIfDev(err)
+			pkgLogger.Errorf("[Destination Connection Tester] Failed to create new request. Err: %v", err)
 			return err
 		}
 		req.Header.Set("Content-Type", "application/json;charset=UTF-8")
@@ -88,8 +88,10 @@ func makePostRequest(url string, payload interface{}) error {
 
 		resp, err = client.Do(req)
 		if err == nil {
+			func() { httputil.CloseResponse(resp) }()
 			break
 		}
+
 		pkgLogger.Errorf("DCT: Config Backend connection error", err)
 		if retryCount > maxRetry {
 			pkgLogger.Error("DCT: max retries exceeded trying to connect to config backend")
@@ -112,7 +114,7 @@ func createTestFileForBatchDestination(destinationID string) string {
 		panic(err)
 	}
 
-	gzipFilePath := fmt.Sprintf("%v/%v/%v.%v.%v.csv.gz", tmpDirPath, rudderConnectionTestingFolder, destinationID, uuid.NewV4(), time.Now().Unix())
+	gzipFilePath := fmt.Sprintf("%v/%v/%v.%v.%v.csv.gz", tmpDirPath, rudderConnectionTestingFolder, destinationID, uuid.New(), time.Now().Unix())
 	err = os.MkdirAll(filepath.Dir(gzipFilePath), os.ModePerm)
 	if err != nil {
 		pkgLogger.Errorf("DCT: Failed to make dir %s for testing this destination id %s: err %v", gzipFilePath, destinationID, err)
@@ -123,15 +125,24 @@ func createTestFileForBatchDestination(destinationID string) string {
 		pkgLogger.Errorf("DCT: Failed to create gzip writer for testing this destination id %s: err %v", gzipFilePath, destinationID, err)
 		panic(err)
 	}
-	gzWriter.WriteGZ(testPayload)
-	gzWriter.CloseGZ()
+	if err = gzWriter.WriteGZ(testPayload); err != nil {
+		panic(err)
+	}
+	if err = gzWriter.CloseGZ(); err != nil {
+		panic(err)
+	}
 	return gzipFilePath
 }
 
 func uploadTestFileForBatchDestination(filename string, keyPrefixes []string, provider string, destination backendconfig.DestinationT) (objectName string, err error) {
-	uploader, err := filemanager.New(&filemanager.SettingsT{
+	uploader, err := filemanager.DefaultFileManagerFactory.New(&filemanager.SettingsT{
 		Provider: provider,
-		Config:   misc.GetObjectStorageConfig(provider, destination.Config),
+		Config: misc.GetObjectStorageConfig(misc.ObjectStorageOptsT{
+			Provider:         provider,
+			Config:           destination.Config,
+			UseRudderStorage: misc.IsConfiguredToUseRudderObjectStorage(destination.Config),
+			WorkspaceID:      destination.WorkspaceID,
+		}),
 	})
 	if err != nil {
 		pkgLogger.Errorf("DCT: Failed to initiate filemanager config for testing this destination id %s: err %v", destination.ID, err)
@@ -143,79 +154,18 @@ func uploadTestFileForBatchDestination(filename string, keyPrefixes []string, pr
 		panic(err)
 	}
 	defer misc.RemoveFilePaths(filename)
-	defer uploadFile.Close()
-	uploadOutput, err := uploader.Upload(uploadFile, keyPrefixes...)
+	defer func() { _ = uploadFile.Close() }()
+	uploadOutput, err := uploader.Upload(context.TODO(), uploadFile, keyPrefixes...)
 	if err != nil {
 		pkgLogger.Errorf("DCT: Failed to upload test file %s for testing this destination id %s: err %v", filename, destination.ID, err)
 	}
 	return uploadOutput.ObjectName, err
 }
 
-func downloadTestFileForBatchDestination(testObjectKey string, provider string, destination backendconfig.DestinationT) (err error) {
-	downloader, err := filemanager.New(&filemanager.SettingsT{
-		Provider: provider,
-		Config:   misc.GetObjectStorageConfig(provider, destination.Config),
-	})
-	if err != nil {
-		pkgLogger.Errorf("DCT: Failed to initiate filemanager config for testing this destination id %s: err %v", destination.ID, err)
-		panic(err)
-	}
-
-	tmpDirPath, err := misc.CreateTMPDIR()
-	if err != nil {
-		panic(err)
-	}
-	testFilePath := fmt.Sprintf("%v/%v/%v.%v.%v.csv.gz", tmpDirPath, rudderConnectionTestingFolder, destination.ID, uuid.NewV4(), time.Now().Unix())
-	err = os.MkdirAll(filepath.Dir(testFilePath), os.ModePerm)
-	if err != nil {
-		pkgLogger.Errorf("DCT: Failed to create directory at path %s: err %v", testFilePath, err)
-		panic(err)
-	}
-	testFile, err := os.Create(testFilePath)
-	if err != nil {
-		panic(err)
-	}
-	err = downloader.Download(testFile, testObjectKey)
-	if err != nil {
-		pkgLogger.Errorf("DCT: Failed to download test file %s for testing this destination id %s: err %v", testObjectKey, destination.ID, err)
-	}
-	testFile.Close()
-	misc.RemoveFilePaths(testFilePath)
-	return err
-
-}
-
 func TestBatchDestinationConnection(destination backendconfig.DestinationT) string {
 	testFileName := createTestFileForBatchDestination(destination.ID)
-	keyPrefixes := []string{config.GetEnv("RUDDER_CONNECTION_TESTING_BUCKET_FOLDER_NAME", "rudder-test-payload"), destination.ID, time.Now().Format("01-02-2006")}
+	keyPrefixes := []string{config.GetString("RUDDER_CONNECTION_TESTING_BUCKET_FOLDER_NAME", misc.RudderTestPayload), destination.ID, time.Now().Format("01-02-2006")}
 	_, err := uploadTestFileForBatchDestination(testFileName, keyPrefixes, destination.DestinationDefinition.Name, destination)
-	var error string
-	if err != nil {
-		error = err.Error()
-	}
-	return error
-}
-
-func TestWarehouseDestinationConnection(destination backendconfig.DestinationT) string {
-	provider := destination.DestinationDefinition.Name
-	whManager, err := manager.New(provider)
-	if err != nil {
-		panic(err)
-	}
-	testFileNameWithPath := createTestFileForBatchDestination(destination.ID)
-	storageProvider := warehouseutils.ObjectStorageType(destination.DestinationDefinition.Name, destination.Config)
-	keyPrefixes := []string{rudderConnectionTestingFolder, destination.ID, time.Now().Format("01-02-2006")}
-	objectKeyName, err := uploadTestFileForBatchDestination(testFileNameWithPath, keyPrefixes, storageProvider, destination)
-	if err != nil {
-		return err.Error()
-	}
-	err = downloadTestFileForBatchDestination(objectKeyName, storageProvider, destination)
-	if err != nil {
-		return err.Error()
-	}
-	err = whManager.TestConnection(warehouseutils.WarehouseT{
-		Destination: destination,
-	})
 	if err != nil {
 		return err.Error()
 	}

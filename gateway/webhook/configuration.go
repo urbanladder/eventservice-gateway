@@ -8,17 +8,23 @@ import (
 )
 
 func loadConfig() {
-	config.Initialize()
-
-	sourceTransformerURL = strings.TrimSuffix(config.GetEnv("DEST_TRANSFORM_URL", "http://localhost:9090"), "/") + "/v1/sources"
+	sourceTransformerURL = strings.TrimSuffix(config.GetString("DEST_TRANSFORM_URL", "http://localhost:9090"), "/") + "/v0/sources"
 	// Number of incoming webhooks that are batched before calling source transformer
-	maxWebhookBatchSize = config.GetInt("Gateway.webhook.maxBatchSize", 32)
+	config.RegisterIntConfigVariable(32, &maxWebhookBatchSize, true, 1, "Gateway.webhook.maxBatchSize")
 	// Timeout after which batch is formed anyway with whatever webhooks are available
-	webhookBatchTimeout = (config.GetDuration("Gateway.webhook.batchTimeoutInMS", time.Duration(20)) * time.Millisecond)
+	config.RegisterDurationConfigVariable(20, &webhookBatchTimeout, true, time.Millisecond, []string{"Gateway.webhook.batchTimeout", "Gateway.webhook.batchTimeoutInMS"}...)
 	// Multiple source transformers are used to generate rudder events from webhooks
-	maxTransformerProcess = config.GetInt("Gateway.webhook.maxTransformerProcess", 64)
+	config.RegisterIntConfigVariable(64, &maxTransformerProcess, false, 1, "Gateway.webhook.maxTransformerProcess")
 	// Max time till when retries to source transformer are done
-	webhookRetryWaitMax = (config.GetDuration("Gateway.webhook.maxRetryTimeInS", time.Duration(10)) * time.Second)
+	config.RegisterDurationConfigVariable(10, &webhookRetryWaitMax, false, time.Second, []string{"Gateway.webhook.maxRetryTime", "Gateway.webhook.maxRetryTimeInS"}...)
+	// Min time gap when retries to source transformer are done
+	config.RegisterDurationConfigVariable(100, &webhookRetryWaitMin, false, time.Millisecond, []string{"Gateway.webhook.minRetryTime", "Gateway.webhook.minRetryTimeInMS"}...)
 	// Max retry attempts to source transformer
-	webhookRetryMax = config.GetInt("Gateway.webhook.maxRetry", 5)
+	config.RegisterIntConfigVariable(5, &webhookRetryMax, false, 1, "Gateway.webhook.maxRetry")
+	// Parse all query params from sources mentioned in this list
+	config.RegisterStringSliceConfigVariable(make([]string, 0), &sourceListForParsingParams, false, "Gateway.webhook.sourceListForParsingParams")
+	// lowercasing the strings in sourceListForParsingParams
+	for i, s := range sourceListForParsingParams {
+		sourceListForParsingParams[i] = strings.ToLower(s)
+	}
 }

@@ -1,16 +1,19 @@
-/*
- * Handling HTTP requests to expose the schemas
- *
- */
+// Package event_schema
+// Handling HTTP requests to expose the schemas
 package event_schema
 
 import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"github.com/rudderlabs/rudder-server/gateway/response"
+	"strconv"
+	"strings"
+
+	"github.com/google/uuid"
 	"github.com/gorilla/mux"
-	uuid "github.com/satori/go.uuid"
+
+	"github.com/rudderlabs/rudder-server/gateway/response"
+	"github.com/rudderlabs/rudder-server/utils/misc"
 )
 
 func handleBasicAuth(r *http.Request) error {
@@ -50,7 +53,226 @@ func (manager *EventSchemaManagerT) GetEventModels(w http.ResponseWriter, r *htt
 		return
 	}
 
-	w.Write(eventTypesJSON)
+	_, _ = w.Write(eventTypesJSON)
+}
+
+func (manager *EventSchemaManagerT) GetJsonSchemas(w http.ResponseWriter, r *http.Request) {
+	err := handleBasicAuth(r)
+	if err != nil {
+		http.Error(w, response.MakeResponse(err.Error()), 400)
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		http.Error(w, response.MakeResponse("Only HTTP GET method is supported"), 400)
+		return
+	}
+
+	writeKeys, ok := r.URL.Query()["WriteKey"]
+	writeKey := ""
+	if ok && writeKeys[0] != "" {
+		writeKey = writeKeys[0]
+	}
+
+	eventModels := manager.fetchEventModelsByWriteKey(writeKey)
+	if len(eventModels) == 0 {
+		http.Error(w, response.MakeResponse("No event models exists to create a tracking plan."), 404)
+		return
+	}
+
+	// generating json schema from eventModels
+	jsonSchemas, err := generateJsonSchFromEM(eventModels)
+	if err != nil {
+		http.Error(w, response.MakeResponse("Internal Error: Failed to Marshal event types"), 500)
+		return
+	}
+
+	_, _ = w.Write(jsonSchemas)
+}
+
+type JSPropertyTypeT struct {
+	Type []string `json:"type"`
+}
+
+type JSPropertyT struct {
+	Property map[string]interface{} `json:"properties"`
+}
+
+type JsonSchemaT struct {
+	Schema            map[string]interface{} `json:"schema"`
+	SchemaType        string                 `json:"schemaType"`
+	SchemaTIdentifier string                 `json:"schemaIdentifier"`
+}
+
+// generateJsonSchFromEM Generates Json schemas from Event Models
+func generateJsonSchFromEM(eventModels []*EventModelT) ([]byte, error) {
+	var jsonSchemas []JsonSchemaT
+	for _, eventModel := range eventModels {
+		flattenedSch := make(map[string]interface{})
+		err := json.Unmarshal(eventModel.Schema, &flattenedSch)
+		if err != nil {
+			pkgLogger.Errorf("Error unmarshalling eventModelSch: %v for ID: %v", err, eventModel.ID)
+			continue
+		}
+		unFlattenedSch, err := unflatten(flattenedSch)
+		if err != nil {
+			pkgLogger.Errorf("Error unflattening flattenedSch: %v for ID: %v", err, eventModel.ID)
+			continue
+		}
+		schemaProperties, err := getETSchProp(eventModel.EventType, unFlattenedSch)
+		if err != nil {
+			pkgLogger.Errorf("Error while getting schema properties: %v for ID: %v", err, eventModel.ID)
+			continue
+		}
+		if len(schemaProperties) == 0 {
+			pkgLogger.Error("Error schema properties doesn't exists for ID: %v", eventModel.ID)
+			continue
+		}
+
+		jsonSchema := generateJsonSchFromSchProp(schemaProperties)
+		jsonSchema["additionalProperties"] = false
+		jsonSchema["$schema"] = "http://json-schema.org/draft-07/schema#"
+
+		// TODO: validate if the jsonSchema is correct.
+		jsonSchemas = append(jsonSchemas, JsonSchemaT{
+			Schema:            jsonSchema,
+			SchemaType:        eventModel.EventType,
+			SchemaTIdentifier: eventModel.EventIdentifier,
+		})
+	}
+	eventJsonSchs, err := json.Marshal(jsonSchemas)
+	if err != nil {
+		return nil, err
+	}
+	return eventJsonSchs, nil
+}
+
+// getETSchProp Get Event Type schema from Event Model Schema
+func getETSchProp(eventType string, eventModelSch map[string]interface{}) (map[string]interface{}, error) {
+	switch eventType {
+	case "track", "screen", "page":
+		filtered, ok := eventModelSch["properties"].(map[string]interface{})
+		if ok {
+			return filtered, nil
+		}
+		return nil, fmt.Errorf("invalid properties")
+	case "identify", "group":
+		filtered, ok := eventModelSch["traits"].(map[string]interface{})
+		if ok {
+			return filtered, nil
+		}
+		return nil, fmt.Errorf("invalid traits")
+	}
+	return nil, fmt.Errorf("invalid eventType")
+}
+
+// generateJsonSchFromSchProp Generated Json schema from unflattened schema properties.
+func generateJsonSchFromSchProp(schemaProperties map[string]interface{}) map[string]interface{} {
+	jsProperties := JSPropertyT{
+		Property: make(map[string]interface{}),
+	}
+	finalSchema := make(map[string]interface{})
+
+	for k, v := range schemaProperties {
+		switch value := v.(type) {
+		case string:
+			jsProperties.Property[k] = getPropertyTypesFromSchValue(value)
+		case map[string]interface{}:
+			// check if map is an array or map
+			if checkIfArray(value) {
+				var vType interface{}
+				for _, v := range value {
+					vt, ok := v.(string)
+					if ok {
+						vType = getPropertyTypesFromSchValue(vt)
+					} else {
+						vType = generateJsonSchFromSchProp(v.(map[string]interface{}))
+					}
+					break
+				}
+				jsProperties.Property[k] = map[string]interface{}{
+					"type":  "array",
+					"items": vType,
+				}
+				break
+			}
+			jsProperties.Property[k] = generateJsonSchFromSchProp(value)
+		default:
+			pkgLogger.Errorf("unknown type found")
+		}
+	}
+	finalSchema["properties"] = jsProperties.Property
+	finalSchema["type"] = "object"
+	return finalSchema
+}
+
+func getPropertyTypesFromSchValue(schVal string) *JSPropertyTypeT {
+	types := strings.Split(schVal, ",")
+	for i, v := range types {
+		types[i] = misc.GetJsonSchemaDTFromGoDT(v)
+	}
+	return &JSPropertyTypeT{
+		Type: types,
+	}
+}
+
+// prop.myarr.0
+// will not be able to say if above is prop{myarr:[0]} or prop{myarr{"0":0}}
+func checkIfArray(value map[string]interface{}) bool {
+	if len(value) == 0 {
+		return false
+	}
+
+	for k := range value {
+		_, err := strconv.Atoi(k)
+		if err != nil {
+			return false
+		}
+		// need not check the array continuity
+	}
+	return true
+}
+
+// https://play.golang.org/p/4juOff38ea
+// or use https://pkg.go.dev/github.com/wolfeidau/unflatten
+// or use https://github.com/nqd/flat
+func unflatten(flat map[string]interface{}) (map[string]interface{}, error) {
+	unflat := map[string]interface{}{}
+
+	for key, value := range flat {
+		keyParts := strings.Split(key, ".")
+
+		// Walk the keys until we get to a leaf node.
+		m := unflat
+		for i, k := range keyParts[:len(keyParts)-1] {
+			v, exists := m[k]
+			if !exists {
+				newMap := map[string]interface{}{}
+				m[k] = newMap
+				m = newMap
+				continue
+			}
+
+			innerMap, ok := v.(map[string]interface{})
+			if !ok {
+				fmt.Printf("key=%v is not an object\n", strings.Join(keyParts[0:i+1], "."))
+				newMap := map[string]interface{}{}
+				m[k] = newMap
+				m = newMap
+				continue
+			}
+			m = innerMap
+		}
+
+		leafKey := keyParts[len(keyParts)-1]
+		if _, exists := m[leafKey]; exists {
+			fmt.Printf("key=%v already exists", key)
+			continue
+		}
+		m[keyParts[len(keyParts)-1]] = value
+	}
+
+	return unflat, nil
 }
 
 func (manager *EventSchemaManagerT) GetEventVersions(w http.ResponseWriter, r *http.Request) {
@@ -79,10 +301,10 @@ func (manager *EventSchemaManagerT) GetEventVersions(w http.ResponseWriter, r *h
 		return
 	}
 
-	w.Write(schemaVersionsJSON)
+	_, _ = w.Write(schemaVersionsJSON)
 }
 
-//TODO: Complete this
+// TODO: Complete this
 func (manager *EventSchemaManagerT) GetKeyCounts(w http.ResponseWriter, r *http.Request) {
 	err := handleBasicAuth(r)
 	if err != nil {
@@ -104,24 +326,23 @@ func (manager *EventSchemaManagerT) GetKeyCounts(w http.ResponseWriter, r *http.
 
 	keyCounts, err := manager.getKeyCounts(eventID)
 	if err != nil {
-		logID := uuid.NewV4().String()
+		logID := uuid.New().String()
 		pkgLogger.Errorf("logID : %s, err: %s", logID, err.Error())
 		http.Error(w, response.MakeResponse(fmt.Sprintf("Internal Error: An error has been logged with logID : %s", logID)), 500)
 		return
 	}
 	keyCountsJSON, err := json.Marshal(keyCounts)
 	if err != nil {
-		logID := uuid.NewV4().String()
+		logID := uuid.New().String()
 		pkgLogger.Errorf("logID : %s, err: %s", logID, err.Error())
 		http.Error(w, response.MakeResponse(fmt.Sprintf("Interna Error: An error has been logged with logID : %s", logID)), 500)
 		return
 	}
 
-	w.Write(keyCountsJSON)
+	_, _ = w.Write(keyCountsJSON)
 }
 
 func (manager *EventSchemaManagerT) getKeyCounts(eventID string) (keyCounts map[string]int64, err error) {
-
 	schemaVersions := manager.fetchSchemaVersionsByEventID(eventID)
 
 	keyCounts = make(map[string]int64)
@@ -157,7 +378,7 @@ func (manager *EventSchemaManagerT) GetEventModelMetadata(w http.ResponseWriter,
 	vars := mux.Vars(r)
 	eventID, ok := vars["EventID"]
 	if !ok {
-		http.Error(w, response.MakeResponse("Mandatory field: VersionID missing"), 400)
+		http.Error(w, response.MakeResponse("Mandatory field: EventID missing"), 400)
 		return
 	}
 
@@ -173,8 +394,7 @@ func (manager *EventSchemaManagerT) GetEventModelMetadata(w http.ResponseWriter,
 		return
 	}
 
-	w.Write(metadataJSON)
-
+	_, _ = w.Write(metadataJSON)
 }
 
 func (manager *EventSchemaManagerT) GetSchemaVersionMetadata(w http.ResponseWriter, r *http.Request) {
@@ -208,7 +428,7 @@ func (manager *EventSchemaManagerT) GetSchemaVersionMetadata(w http.ResponseWrit
 		return
 	}
 
-	w.Write(metadataJSON)
+	_, _ = w.Write(metadataJSON)
 }
 
 func (manager *EventSchemaManagerT) GetSchemaVersionMissingKeys(w http.ResponseWriter, r *http.Request) {
@@ -238,7 +458,7 @@ func (manager *EventSchemaManagerT) GetSchemaVersionMissingKeys(w http.ResponseW
 
 	eventModel, err := manager.fetchEventModelByID(schema.EventModelID)
 	if err != nil {
-		w.Write([]byte("[]"))
+		_, _ = w.Write([]byte("[]"))
 		return
 	}
 
@@ -247,7 +467,7 @@ func (manager *EventSchemaManagerT) GetSchemaVersionMissingKeys(w http.ResponseW
 
 	err = json.Unmarshal(schema.Schema, &schemaMap)
 	if err != nil {
-		logID := uuid.NewV4().String()
+		logID := uuid.New().String()
 		pkgLogger.Errorf("logID : %s, err: %s", logID, err.Error())
 		http.Error(w, response.MakeResponse(fmt.Sprintf("Internal Error: An error has been logged with logID : %s", logID)), 500)
 		return
@@ -255,7 +475,7 @@ func (manager *EventSchemaManagerT) GetSchemaVersionMissingKeys(w http.ResponseW
 
 	err = json.Unmarshal(eventModel.Schema, &masterSchemaMap)
 	if err != nil {
-		logID := uuid.NewV4().String()
+		logID := uuid.New().String()
 		pkgLogger.Errorf("logID : %s, err: %s", logID, err.Error())
 		http.Error(w, response.MakeResponse(fmt.Sprintf("Interna Error: An error has been logged with logID : %s", logID)), 500)
 		return
@@ -275,27 +495,27 @@ func (manager *EventSchemaManagerT) GetSchemaVersionMissingKeys(w http.ResponseW
 		return
 	}
 
-	w.Write(missingKeyJSON)
+	_, _ = w.Write(missingKeyJSON)
 }
 
 func (manager *EventSchemaManagerT) fetchEventModelsByWriteKey(writeKey string) []*EventModelT {
 	var eventModelsSelectSQL string
 	if writeKey == "" {
-		eventModelsSelectSQL = fmt.Sprintf(`SELECT * FROM %s`, EVENT_MODELS_TABLE)
+		eventModelsSelectSQL = fmt.Sprintf(`SELECT id, uuid, write_key, event_type, event_model_identifier, created_at, schema, total_count, last_seen FROM %s`, EVENT_MODELS_TABLE)
 	} else {
-		eventModelsSelectSQL = fmt.Sprintf(`SELECT * FROM %s WHERE write_key = '%s'`, EVENT_MODELS_TABLE, writeKey)
+		eventModelsSelectSQL = fmt.Sprintf(`SELECT id, uuid, write_key, event_type, event_model_identifier, created_at, schema, total_count, last_seen FROM %s WHERE write_key = '%s'`, EVENT_MODELS_TABLE, writeKey)
 	}
 
 	rows, err := manager.dbHandle.Query(eventModelsSelectSQL)
 	assertError(err)
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	eventModels := make([]*EventModelT, 0)
 
 	for rows.Next() {
 		var eventModel EventModelT
 		err := rows.Scan(&eventModel.ID, &eventModel.UUID, &eventModel.WriteKey, &eventModel.EventType,
-			&eventModel.EventIdentifier, &eventModel.CreatedAt, &eventModel.Schema, &eventModel.Metadata, &eventModel.PrivateData, &eventModel.TotalCount, &eventModel.LastSeen)
+			&eventModel.EventIdentifier, &eventModel.CreatedAt, &eventModel.Schema, &eventModel.TotalCount, &eventModel.LastSeen)
 		assertError(err)
 
 		eventModels = append(eventModels, &eventModel)
@@ -305,17 +525,17 @@ func (manager *EventSchemaManagerT) fetchEventModelsByWriteKey(writeKey string) 
 }
 
 func (manager *EventSchemaManagerT) fetchSchemaVersionsByEventID(eventID string) []*SchemaVersionT {
-	schemaVersionsSelectSQL := fmt.Sprintf(`SELECT id, uuid, event_model_id, schema_hash, schema, first_seen, last_seen, total_count FROM %s WHERE event_model_id = '%s'`, SCHEMA_VERSIONS_TABLE, eventID)
+	schemaVersionsSelectSQL := fmt.Sprintf(`SELECT id, uuid, event_model_id, schema, first_seen, last_seen, total_count FROM %s WHERE event_model_id = '%s'`, SCHEMA_VERSIONS_TABLE, eventID)
 
 	rows, err := manager.dbHandle.Query(schemaVersionsSelectSQL)
 	assertError(err)
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	schemaVersions := make([]*SchemaVersionT, 0)
 
 	for rows.Next() {
 		var schemaVersion SchemaVersionT
-		err := rows.Scan(&schemaVersion.ID, &schemaVersion.UUID, &schemaVersion.EventModelID, &schemaVersion.SchemaHash,
+		err := rows.Scan(&schemaVersion.ID, &schemaVersion.UUID, &schemaVersion.EventModelID,
 			&schemaVersion.Schema, &schemaVersion.FirstSeen, &schemaVersion.LastSeen, &schemaVersion.TotalCount)
 		assertError(err)
 
@@ -326,18 +546,18 @@ func (manager *EventSchemaManagerT) fetchSchemaVersionsByEventID(eventID string)
 }
 
 func (manager *EventSchemaManagerT) fetchEventModelByID(id string) (*EventModelT, error) {
-	eventModelsSelectSQL := fmt.Sprintf(`SELECT * FROM %s WHERE uuid = '%s'`, EVENT_MODELS_TABLE, id)
+	eventModelsSelectSQL := fmt.Sprintf(`SELECT id, uuid, write_key, event_type, event_model_identifier, created_at, schema, total_count, last_seen FROM %s WHERE uuid = '%s'`, EVENT_MODELS_TABLE, id)
 
 	rows, err := manager.dbHandle.Query(eventModelsSelectSQL)
 	assertError(err)
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	eventModels := make([]*EventModelT, 0)
 
 	for rows.Next() {
 		var eventModel EventModelT
 		err := rows.Scan(&eventModel.ID, &eventModel.UUID, &eventModel.WriteKey, &eventModel.EventType,
-			&eventModel.EventIdentifier, &eventModel.CreatedAt, &eventModel.Schema, &eventModel.Metadata, &eventModel.PrivateData, &eventModel.TotalCount, &eventModel.LastSeen)
+			&eventModel.EventIdentifier, &eventModel.CreatedAt, &eventModel.Schema, &eventModel.TotalCount, &eventModel.LastSeen)
 		assertError(err)
 
 		eventModels = append(eventModels, &eventModel)
@@ -356,18 +576,17 @@ func (manager *EventSchemaManagerT) fetchEventModelByID(id string) (*EventModelT
 }
 
 func (manager *EventSchemaManagerT) fetchSchemaVersionByID(id string) (*SchemaVersionT, error) {
-	schemaVersionsSelectSQL := fmt.Sprintf(`SELECT id, uuid, event_model_id, schema_hash, schema, first_seen, last_seen, total_count FROM %s WHERE uuid = '%s'`, SCHEMA_VERSIONS_TABLE, id)
+	schemaVersionsSelectSQL := fmt.Sprintf(`SELECT id, uuid, event_model_id, schema, first_seen, last_seen, total_count FROM %s WHERE uuid = '%s'`, SCHEMA_VERSIONS_TABLE, id)
 
 	rows, err := manager.dbHandle.Query(schemaVersionsSelectSQL)
 	assertError(err)
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	schemaVersions := make([]*SchemaVersionT, 0)
 
 	for rows.Next() {
 		var schemaVersion SchemaVersionT
-		err := rows.Scan(&schemaVersion.ID, &schemaVersion.UUID, &schemaVersion.EventModelID, &schemaVersion.SchemaHash,
-			&schemaVersion.Schema, &schemaVersion.FirstSeen, &schemaVersion.LastSeen, &schemaVersion.TotalCount)
+		err := rows.Scan(&schemaVersion.ID, &schemaVersion.UUID, &schemaVersion.EventModelID, &schemaVersion.Schema, &schemaVersion.FirstSeen, &schemaVersion.LastSeen, &schemaVersion.TotalCount)
 		assertError(err)
 
 		schemaVersions = append(schemaVersions, &schemaVersion)
@@ -390,7 +609,7 @@ func (manager *EventSchemaManagerT) fetchMetadataByEventVersionID(eventVersionID
 
 	rows, err := manager.dbHandle.Query(metadataSelectSQL)
 	assertError(err)
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	metadatas := make([]*MetaDataT, 0)
 
@@ -424,7 +643,7 @@ func (manager *EventSchemaManagerT) fetchMetadataByEventModelID(eventModelID str
 
 	rows, err := manager.dbHandle.Query(metadataSelectSQL)
 	assertError(err)
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	metadatas := make([]*MetaDataT, 0)
 

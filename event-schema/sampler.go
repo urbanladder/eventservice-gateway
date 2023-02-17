@@ -15,7 +15,7 @@ type ReservoirSample struct {
 	sampleEvents  []interface{}
 }
 
-func NewReservoirSampler(reservoirSize int, currSize int, totalCount int64) (rs *ReservoirSample) {
+func NewReservoirSampler(reservoirSize, currSize int, totalCount int64) (rs *ReservoirSample) {
 	reservoirSampler := new(ReservoirSample)
 	reservoirSampler.currSize = currSize
 	reservoirSampler.reservoirSize = reservoirSize
@@ -26,15 +26,17 @@ func NewReservoirSampler(reservoirSize int, currSize int, totalCount int64) (rs 
 	return reservoirSampler
 }
 
-func (rs *ReservoirSample) add(item interface{}) {
+func (rs *ReservoirSample) add(item interface{}, incTotal bool) {
 	if item == nil {
-		pkgLogger.Info("Debug : Trying to add an empty event in reservoir sample")
+		pkgLogger.Debug("Debug : Trying to add an empty event in reservoir sample")
 		return
 	}
 	rs.lock.Lock()
 	defer rs.lock.Unlock()
 
-	rs.totalCount++
+	if incTotal {
+		rs.totalCount++
+	}
 
 	if rs.currSize < rs.reservoirSize {
 		rs.sampleEvents[rs.currSize] = item

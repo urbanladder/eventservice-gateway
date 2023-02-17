@@ -1,67 +1,140 @@
 package apphandlers
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/rudderlabs/rudder-server/app"
+	"github.com/rudderlabs/rudder-server/app/cluster"
+	"github.com/rudderlabs/rudder-server/config"
 	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
 	"github.com/rudderlabs/rudder-server/gateway"
 	"github.com/rudderlabs/rudder-server/jobsdb"
 	ratelimiter "github.com/rudderlabs/rudder-server/rate-limiter"
 	"github.com/rudderlabs/rudder-server/services/db"
-	sourcedebugger "github.com/rudderlabs/rudder-server/services/source-debugger"
+	sourcedebugger "github.com/rudderlabs/rudder-server/services/debugger/source"
+	fileuploader "github.com/rudderlabs/rudder-server/services/fileuploader"
+	"github.com/rudderlabs/rudder-server/utils/logger"
 	"github.com/rudderlabs/rudder-server/utils/misc"
-
-	// This is necessary for compatibility with enterprise features
-	_ "github.com/rudderlabs/rudder-server/imports"
+	"github.com/rudderlabs/rudder-server/utils/types/deployment"
 )
 
-//GatewayApp is the type for Gateway type implemention
-type GatewayApp struct {
-	App            app.Interface
-	VersionHandler func(w http.ResponseWriter, r *http.Request)
+// gatewayApp is the type for Gateway type implementation
+type gatewayApp struct {
+	setupDone      bool
+	app            app.App
+	versionHandler func(w http.ResponseWriter, r *http.Request)
+	log            logger.Logger
+	config         struct {
+		gatewayDSLimit int
+	}
 }
 
-func (gatewayApp *GatewayApp) GetAppType() string {
-	return fmt.Sprintf("rudder-server-%s", app.GATEWAY)
+func (a *gatewayApp) loadConfiguration() {
+	config.RegisterIntConfigVariable(0, &a.config.gatewayDSLimit, true, 1, "Gateway.jobsDB.dsLimit", "JobsDB.dsLimit")
 }
 
-func (gatewayApp *GatewayApp) StartRudderCore(options *app.Options) {
-	pkgLogger.Info("Gateway starting")
+func (a *gatewayApp) Setup(options *app.Options) error {
+	a.loadConfiguration()
+	if err := db.HandleNullRecovery(options.NormalMode, options.DegradedMode, misc.AppStartTime, app.GATEWAY); err != nil {
+		return err
+	}
+	if err := rudderCoreDBValidator(); err != nil {
+		return err
+	}
+	if err := rudderCoreWorkSpaceTableSetup(); err != nil {
+		return err
+	}
+	a.setupDone = true
+	return nil
+}
 
-	rudderCoreBaseSetup()
+func (a *gatewayApp) StartRudderCore(ctx context.Context, options *app.Options) error {
+	if !a.setupDone {
+		return fmt.Errorf("gateway cannot start, database is not setup")
+	}
+	a.log.Info("Gateway starting")
 
-	var gatewayDB jobsdb.HandleT
-	pkgLogger.Info("Clearing DB ", options.ClearDB)
+	readonlyGatewayDB, err := setupReadonlyDBs()
+	if err != nil {
+		return err
+	}
 
-	sourcedebugger.Setup()
+	deploymentType, err := deployment.GetFromEnv()
+	if err != nil {
+		return fmt.Errorf("failed to get deployment type: %v", err)
+	}
 
-	migrationMode := gatewayApp.App.Options().MigrationMode
-	gatewayDB.Setup(jobsdb.Write, options.ClearDB, "gw", gwDBRetention, migrationMode, false)
+	a.log.Infof("Configured deployment type: %q", deploymentType)
+	a.log.Info("Clearing DB ", options.ClearDB)
 
-	enableGateway := true
+	sourceHandle, err := sourcedebugger.NewHandle(backendconfig.DefaultBackendConfig)
+	if err != nil {
+		return err
+	}
+	defer sourceHandle.Stop()
 
-	if gatewayApp.App.Features().Migrator != nil {
-		if migrationMode == db.IMPORT || migrationMode == db.EXPORT || migrationMode == db.IMPORT_EXPORT {
-			enableGateway = (migrationMode != db.EXPORT)
+	fileUploaderProvider := fileuploader.NewProvider(ctx, backendconfig.DefaultBackendConfig)
+
+	gatewayDB := jobsdb.NewForWrite(
+		"gw",
+		jobsdb.WithClearDB(options.ClearDB),
+		jobsdb.WithStatusHandler(),
+		jobsdb.WithDSLimit(&a.config.gatewayDSLimit),
+		jobsdb.WithFileUploaderProvider(fileUploaderProvider),
+	)
+	defer gatewayDB.Close()
+	if err := gatewayDB.Start(); err != nil {
+		return fmt.Errorf("could not start gatewayDB: %w", err)
+	}
+	defer gatewayDB.Stop()
+
+	g, ctx := errgroup.WithContext(ctx)
+
+	modeProvider, err := resolveModeProvider(a.log, deploymentType)
+	if err != nil {
+		return err
+	}
+
+	dm := cluster.Dynamic{
+		Provider:         modeProvider,
+		GatewayComponent: true,
+	}
+	g.Go(func() error {
+		return dm.Run(ctx)
+	})
+
+	var gw gateway.HandleT
+	var rateLimiter ratelimiter.HandleT
+
+	rateLimiter.SetUp()
+	gw.SetReadonlyDB(readonlyGatewayDB)
+	rsourcesService, err := NewRsourcesService(deploymentType)
+	if err != nil {
+		return err
+	}
+	err = gw.Setup(
+		ctx,
+		a.app, backendconfig.DefaultBackendConfig, gatewayDB,
+		&rateLimiter, a.versionHandler, rsourcesService, sourceHandle,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to setup gateway: %w", err)
+	}
+	defer func() {
+		if err := gw.Shutdown(); err != nil {
+			a.log.Warnf("Gateway shutdown error: %v", err)
 		}
+	}()
 
-		gatewayApp.App.Features().Migrator.PrepareJobsdbsForImport(&gatewayDB, nil, nil)
-	}
-
-	if enableGateway {
-		var gateway gateway.HandleT
-		var rateLimiter ratelimiter.HandleT
-
-		rateLimiter.SetUp()
-		gateway.SetReadonlyDBs(&readonlyGatewayDB, &readonlyRouterDB, &readonlyBatchRouterDB)
-		gateway.Setup(gatewayApp.App, backendconfig.DefaultBackendConfig, &gatewayDB, &rateLimiter, gatewayApp.VersionHandler)
-		gateway.StartWebHandler()
-	}
-	//go readIOforResume(router) //keeping it as input from IO, to be replaced by UI
-}
-
-func (gateway *GatewayApp) HandleRecovery(options *app.Options) {
-	db.HandleNullRecovery(options.NormalMode, options.DegradedMode, options.MigrationMode, misc.AppStartTime, app.GATEWAY)
+	g.Go(func() error {
+		return gw.StartAdminHandler(ctx)
+	})
+	g.Go(func() error {
+		return gw.StartWebHandler(ctx)
+	})
+	return g.Wait()
 }

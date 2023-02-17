@@ -1,90 +1,51 @@
 package streammanager
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
 
+	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
+	"github.com/rudderlabs/rudder-server/services/streammanager/bqstream"
+	"github.com/rudderlabs/rudder-server/services/streammanager/common"
 	"github.com/rudderlabs/rudder-server/services/streammanager/eventbridge"
 	"github.com/rudderlabs/rudder-server/services/streammanager/firehose"
 	"github.com/rudderlabs/rudder-server/services/streammanager/googlepubsub"
+	"github.com/rudderlabs/rudder-server/services/streammanager/googlesheets"
 	"github.com/rudderlabs/rudder-server/services/streammanager/kafka"
 	"github.com/rudderlabs/rudder-server/services/streammanager/kinesis"
+	"github.com/rudderlabs/rudder-server/services/streammanager/lambda"
 	"github.com/rudderlabs/rudder-server/services/streammanager/personalize"
 )
 
 // NewProducer delegates the call to the appropriate based on parameter destination for creating producer
-func NewProducer(destinationConfig interface{}, destType string) (interface{}, error) {
-
-	switch destType {
+func NewProducer(destination *backendconfig.DestinationT, opts common.Opts) (common.StreamProducer, error) {
+	if destination == nil {
+		return nil, errors.New("destination should not be nil")
+	}
+	switch destination.DestinationDefinition.Name {
 	case "AZURE_EVENT_HUB":
-		producer, err := kafka.NewProducerForAzureEventHub(destinationConfig)
-		return producer, err
+		return kafka.NewProducerForAzureEventHubs(destination, opts)
 	case "CONFLUENT_CLOUD":
-		producer, err := kafka.NewProducerForConfluentCloud(destinationConfig)
-		return producer, err
+		return kafka.NewProducerForConfluentCloud(destination, opts)
 	case "EVENTBRIDGE":
-		producer, err := eventbridge.NewProducer(destinationConfig)
-		return producer, err
+		return eventbridge.NewProducer(destination, opts)
 	case "FIREHOSE":
-		producer, err := firehose.NewProducer(destinationConfig)
-		return producer, err
+		return firehose.NewProducer(destination, opts)
 	case "KAFKA":
-		producer, err := kafka.NewProducer(destinationConfig)
-		return producer, err
+		return kafka.NewProducer(destination, opts)
 	case "KINESIS":
-		producer, err := kinesis.NewProducer(destinationConfig)
-		return producer, err
+		return kinesis.NewProducer(destination, opts)
 	case "GOOGLEPUBSUB":
-		producer, err := googlepubsub.NewProducer(destinationConfig)
-		return producer, err
+		return googlepubsub.NewProducer(destination, opts)
+	case "GOOGLESHEETS":
+		return googlesheets.NewProducer(destination, opts)
 	case "PERSONALIZE":
-		producer, err := personalize.NewProducer(destinationConfig)
-		return producer, err
+		return personalize.NewProducer(destination, opts)
+	case "BQSTREAM":
+		return bqstream.NewProducer(destination, opts)
+	case "LAMBDA":
+		return lambda.NewProducer(destination, opts)
 	default:
-		return nil, fmt.Errorf("No provider configured for StreamManager") //404, "No provider configured for StreamManager", ""
+		return nil, fmt.Errorf("no provider configured for StreamManager") // 404, "No provider configured for StreamManager", ""
 	}
-
-}
-
-// CloseProducer delegates the call to the appropriate manager based on parameter destination to close a given producer
-func CloseProducer(producer interface{}, destType string) error {
-
-	switch destType {
-	case "KINESIS", "FIREHOSE", "EVENTBRIDGE", "PERSONALIZE":
-		return nil
-	case "KAFKA", "AZURE_EVENT_HUB", "CONFLUENT_CLOUD":
-		err := kafka.CloseProducer(producer)
-		return err
-	case "GOOGLEPUBSUB":
-		err := googlepubsub.CloseProducer(producer)
-		return err
-	default:
-		return fmt.Errorf("No provider configured for StreamManager") //404, "No provider configured for StreamManager", ""
-	}
-
-}
-
-type StreamProducer interface {
-	Produce(jsonData json.RawMessage, producer interface{}, destConfig interface{}) (int, string, string)
-}
-
-// Produce delegates call to appropriate manager based on parameter destination
-func Produce(jsonData json.RawMessage, destType string, producer interface{}, config interface{}) (int, string, string) {
-	switch destType {
-	case "KINESIS":
-		return kinesis.Produce(jsonData, producer, config)
-	case "KAFKA", "AZURE_EVENT_HUB", "CONFLUENT_CLOUD":
-		return kafka.Produce(jsonData, producer, config)
-	case "FIREHOSE":
-		return firehose.Produce(jsonData, producer, config)
-	case "EVENTBRIDGE":
-		return eventbridge.Produce(jsonData, producer, config)
-	case "GOOGLEPUBSUB":
-		return googlepubsub.Produce(jsonData, producer, config)
-	case "PERSONALIZE":
-		return personalize.Produce(jsonData, producer, config)
-	default:
-		return 404, "No provider configured for StreamManager", "No provider configured for StreamManager"
-	}
-
 }

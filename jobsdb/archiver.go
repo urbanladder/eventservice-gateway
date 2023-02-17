@@ -1,6 +1,7 @@
 package jobsdb
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"time"
@@ -14,14 +15,22 @@ var (
 	archiverTickerTime time.Duration
 )
 
-func init() {
-	archivalTimeInDays = config.GetInt("JobsDB.archivalTimeInDays", 10)
-	archiverTickerTime = config.GetDuration("JobsDB.archiverTickerTimeInMin", 1440) * time.Minute // default 1 day
+func Init() {
+	loadConfigArchiver()
 }
 
-func runArchiver(prefix string, dbHandle *sql.DB) {
+func loadConfigArchiver() {
+	config.RegisterIntConfigVariable(10, &archivalTimeInDays, true, 1, "JobsDB.archivalTimeInDays")
+	config.RegisterDurationConfigVariable(1440, &archiverTickerTime, true, time.Minute, []string{"JobsDB.archiverTickerTime", "JobsDB.archiverTickerTimeInMin"}...) // default 1 day
+}
+
+func runArchiver(ctx context.Context, prefix string, dbHandle *sql.DB) {
 	for {
+		select {
+		case <-time.After(archiverTickerTime):
+		case <-ctx.Done():
+			return
+		}
 		archiver.ArchiveOldRecords(fmt.Sprintf("%s_journal", prefix), "start_time", archivalTimeInDays, dbHandle)
-		time.Sleep(archiverTickerTime)
 	}
 }

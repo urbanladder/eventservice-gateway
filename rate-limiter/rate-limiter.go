@@ -14,34 +14,34 @@ var (
 	eventLimit            int
 	rateLimitWindowInMins time.Duration
 	noOfBucketsInWindow   int
-	pkgLogger             logger.LoggerI
+	pkgLogger             logger.Logger
 )
 
-//RateLimiter is an interface for rate limiting functions
+// RateLimiter is an interface for rate limiting functions
 type RateLimiter interface {
 	LimitReached(key string) bool
 }
 
-//HandleT is a Handle for event limiter
+// HandleT is a Handle for event limiter
 type HandleT struct {
 	restrictor restrictor.Restrictor
 }
 
-func init() {
+func Init() {
 	loadConfig()
 	pkgLogger = logger.NewLogger().Child("rate-limiter")
 }
 
 func loadConfig() {
 	// Event limit when rate limit is enabled. 1000 by default
-	eventLimit = config.GetInt("RateLimit.eventLimit", 1000)
+	config.RegisterIntConfigVariable(1000, &eventLimit, false, 1, "RateLimit.eventLimit")
 	// Rolling time window for event limit. 60 mins by default
-	rateLimitWindowInMins = config.GetDuration("RateLimit.rateLimitWindowInMins", time.Duration(60)) * time.Minute
+	config.RegisterDurationConfigVariable(60, &rateLimitWindowInMins, false, time.Minute, []string{"RateLimit.rateLimitWindow", "RateLimit.rateLimitWindowInMins"}...)
 	// Number of buckets in time window. 12 by default
-	noOfBucketsInWindow = config.GetInt("RateLimit.noOfBucketsInWindow", 12)
+	config.RegisterIntConfigVariable(12, &noOfBucketsInWindow, false, 1, "RateLimit.noOfBucketsInWindow")
 }
 
-//SetUp eventLimiter
+// SetUp eventLimiter
 func (rateLimiter *HandleT) SetUp() {
 	store, err := restrictor.NewMemoryStore()
 	if err != nil {
@@ -51,7 +51,7 @@ func (rateLimiter *HandleT) SetUp() {
 	rateLimiter.restrictor = restrictor.NewRestrictor(rateLimitWindowInMins, uint32(eventLimit), uint32(noOfBucketsInWindow), store)
 }
 
-//LimitReached returns true if number of events in the rolling window is less than the max events allowed, else false
+// LimitReached returns true if number of events in the rolling window is less than the max events allowed, else false
 func (rateLimiter *HandleT) LimitReached(key string) bool {
 	return rateLimiter.restrictor.LimitReached(key)
 }

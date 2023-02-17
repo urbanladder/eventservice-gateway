@@ -1,287 +1,270 @@
+//go:generate mockgen -destination=../../mocks/services/stats/mock_stats.go -package mock_stats github.com/rudderlabs/rudder-server/services/stats Stats,Measurement
+
 package stats
 
 import (
+	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/cenkalti/backoff"
+	"gopkg.in/alexcesaro/statsd.v2"
+
 	"github.com/rudderlabs/rudder-server/config"
 	"github.com/rudderlabs/rudder-server/rruntime"
+	"github.com/rudderlabs/rudder-server/services/metric"
 	"github.com/rudderlabs/rudder-server/utils/logger"
-	"gopkg.in/alexcesaro/statsd.v2"
 )
 
 const (
-	CountType = "count"
-	TimerType = "timer"
-	GaugeType = "gauge"
+	CountType     = "count"
+	TimerType     = "timer"
+	GaugeType     = "gauge"
+	HistogramType = "histogram"
 )
 
-var client *statsd.Client
-var taggedClientsMap = make(map[string]*statsd.Client)
-var statsEnabled bool
-var statsTagsFormat string
-var statsdServerURL string
-var instanceID string
-var conn statsd.Option
-var taggedClientsMapLock sync.RWMutex
-var enabled bool
-var statsCollectionInterval int64
-var enableCPUStats bool
-var enableMemStats bool
-var enableGCStats bool
-var rc runtimeStatsCollector
-var pkgLogger logger.LoggerI
-var statsSamplingRate float32
-
-// DefaultStats is a common implementation of StatsD stats managements
-var DefaultStats Stats
-
 func init() {
-	statsEnabled = config.GetBool("enableStats", false)
-	statsTagsFormat = config.GetString("statsTagsFormat", "influxdb")
-	statsdServerURL = config.GetEnv("STATSD_SERVER_URL", "localhost:8125")
-	instanceID = config.GetEnv("INSTANCE_ID", "")
-	enabled = config.GetBool("RuntimeStats.enabled", true)
-	statsCollectionInterval = config.GetInt64("RuntimeStats.statsCollectionInterval", 10)
-	enableCPUStats = config.GetBool("RuntimeStats.enableCPUStats", true)
-	enableMemStats = config.GetBool("RuntimeStats.enabledMemStats", true)
-	enableGCStats = config.GetBool("RuntimeStats.enableGCStats", true)
-	statsSamplingRate = float32(config.GetFloat64("statsSamplingRate", 1))
-
-	pkgLogger = logger.NewLogger().Child("stats")
-
+	Default = NewStats(config.Default, logger.Default, metric.Instance)
 }
 
+// Default is the default (singleton) Stats instance
+var Default Stats
+
+// Stats manages stat Measurements
+type Stats interface {
+	// NewStat creates an untagged measurement
+	NewStat(name, statType string) (m Measurement)
+
+	// NewTaggedStat creates a tagged measurement with a sampling rate of 1.0
+	NewTaggedStat(name, statType string, tags Tags) Measurement
+
+	// NewSampledTaggedStat creates a tagged measurement with the configured sampling rate (statsSamplingRate)
+	NewSampledTaggedStat(name, statType string, tags Tags) Measurement
+
+	// Start starts the stats service. It tries to connect to statsd server once and returns immediately.
+	// If it fails to connect, it will retry in the background indefinitely, however any stats published in the meantime will be lost.
+	Start(ctx context.Context)
+
+	// Stop stops the service and collection of periodic stats.
+	Stop()
+}
+
+// Tags is a map of key value pairs
 type Tags map[string]string
 
-// Stats manages provisioning of RudderStats
-type Stats interface {
-	NewStat(Name string, StatType string) (rStats RudderStats)
-	NewTaggedStat(Name string, StatType string, tags Tags) RudderStats
-	NewSampledTaggedStat(Name string, StatType string, tags Tags) RudderStats
+// Strings returns all key value pairs as an ordered list of strings, sorted by increasing key order
+func (t Tags) Strings() []string {
+	if len(t) == 0 {
+		return nil
+	}
+	res := make([]string, 0, len(t)*2)
+	// sorted by tag name (!important for consistent map iteration order)
+	tagNames := make([]string, 0, len(t))
+	for n := range t {
+		tagNames = append(tagNames, n)
+	}
+	sort.Strings(tagNames)
+	for _, tagName := range tagNames {
+		tagVal := t[tagName]
+		res = append(res, strings.ReplaceAll(tagName, ":", "-"), strings.ReplaceAll(tagVal, ":", "-"))
+	}
+	return res
 }
 
-// HandleT is the default implementation of Stats
-type HandleT struct {
+// String returns all key value pairs as a single string, separated by commas, sorted by increasing key order
+func (t Tags) String() string {
+	return strings.Join(t.Strings(), ",")
 }
 
-// RudderStats provides functions to interact with StatsD stats
-type RudderStats interface {
-	Count(n int)
-	Increment()
-
-	Gauge(value interface{})
-
-	Start()
-	End()
-	DeferredTimer()
-	SendTiming(duration time.Duration)
+// NewStats create a new Stats instance using the provided config, logger factory and metric manager as dependencies
+func NewStats(config *config.Config, loggerFactory *logger.Factory, metricManager metric.Manager) Stats {
+	s := &statsdStats{
+		log: loggerFactory.NewLogger().Child("stats"),
+		conf: &statsdConfig{
+			enabled:         config.GetBool("enableStats", true),
+			tagsFormat:      config.GetString("statsTagsFormat", "influxdb"),
+			excludedTags:    config.GetStringSlice("statsExcludedTags", nil),
+			statsdServerURL: config.GetString("STATSD_SERVER_URL", "localhost:8125"),
+			instanceID:      config.GetString("INSTANCE_ID", ""),
+			samplingRate:    float32(config.GetFloat64("statsSamplingRate", 1)),
+			periodic: periodicStatsConfig{
+				enabled:                 config.GetBool("RuntimeStats.enabled", true),
+				statsCollectionInterval: config.GetInt64("RuntimeStats.statsCollectionInterval", 10),
+				enableCPUStats:          config.GetBool("RuntimeStats.enableCPUStats", true),
+				enableMemStats:          config.GetBool("RuntimeStats.enabledMemStats", true),
+				enableGCStats:           config.GetBool("RuntimeStats.enableGCStats", true),
+				metricManager:           metricManager,
+			},
+		},
+		state: &statsdState{
+			client:         &statsdClient{},
+			clients:        make(map[string]*statsdClient),
+			pendingClients: make(map[string]*statsdClient),
+		},
+	}
+	return s
 }
 
-// RudderStatsT is the default implementation of a StatsD stat
-type RudderStatsT struct {
-	Name        string
-	StatType    string
-	Timing      statsd.Timing
-	DestID      string
-	Client      *statsd.Client
-	dontProcess bool
+// statsdStats is the statsd-specific implementation of Stats
+type statsdStats struct {
+	log   logger.Logger
+	conf  *statsdConfig
+	state *statsdState
 }
 
-//Setup creates a new statsd client
-func Setup() {
+func (s *statsdStats) Start(ctx context.Context) {
+	if !s.conf.enabled {
+		return
+	}
+	s.state.conn = statsd.Address(s.conf.statsdServerURL)
+	// since, we don't want setup to be a blocking call, creating a separate `go routine`` for retry to get statsd client.
 	var err error
-	conn = statsd.Address(statsdServerURL)
-	//TODO: Add tags by calling a function...
-	client, err = statsd.New(conn, statsd.TagsFormat(statsd.InfluxDB), defaultTags())
-	if err != nil {
-		// If nothing is listening on the target port, an error is returned and
-		// the returned client does nothing but is still usable. So we can
-		// just log the error and go on.
-		pkgLogger.Error(err)
+	// NOTE: this is to get atleast a dummy client, even if there is a failure. So, that nil pointer error is not received when client is called.
+	s.state.client.statsd, err = statsd.New(s.state.conn, s.conf.statsdTagsFormat(), s.conf.statsdDefaultTags())
+	if err == nil {
+		s.state.clientsLock.Lock()
+		s.state.connEstablished = true
+		s.state.clientsLock.Unlock()
 	}
-	if client != nil {
-		rruntime.Go(func() {
-			collectRuntimeStats(client)
-		})
-	}
+	rruntime.Go(func() {
+		if err != nil {
+			s.state.client.statsd, err = s.getNewStatsdClientWithExpoBackoff(ctx, s.state.conn, s.conf.statsdTagsFormat(), s.conf.statsdDefaultTags())
+			if err != nil {
+				s.conf.enabled = false
+				s.log.Errorf("error while creating new statsd client: %v", err)
+			} else {
+				s.state.clientsLock.Lock()
+				for _, client := range s.state.pendingClients {
+					client.statsd = s.state.client.statsd.Clone(s.state.conn, s.conf.statsdTagsFormat(), s.conf.statsdDefaultTags(), statsd.Tags(client.tags...), statsd.SampleRate(client.samplingRate))
+				}
 
-	DefaultStats = &HandleT{}
+				s.log.Info("statsd client setup succeeded.")
+				s.state.connEstablished = true
+				s.state.pendingClients = nil
+				s.state.clientsLock.Unlock()
+			}
+		}
+		if err == nil && ctx.Err() == nil {
+			s.collectPeriodicStats()
+		}
+	})
 }
 
-// NewStat creates a new RudderStats with provided Name and Type
-func (s *HandleT) NewStat(Name string, StatType string) (rStats RudderStats) {
-	return &RudderStatsT{
-		Name:     Name,
-		StatType: StatType,
-		Client:   client,
-	}
-}
-
-// NewStat creates a new RudderStats with provided Name and Type
-// Deprecated: Use DefaultStats for managing stats instead
-func NewStat(Name string, StatType string) (rStats RudderStats) {
-	return DefaultStats.NewStat(Name, StatType)
-}
-
-func (s *HandleT) NewTaggedStat(Name string, StatType string, tags Tags) (rStats RudderStats) {
-	return newTaggedStat(Name, StatType, tags, 1)
-}
-
-func (s *HandleT) NewSampledTaggedStat(Name string, StatType string, tags Tags) (rStats RudderStats) {
-	return newTaggedStat(Name, StatType, tags, statsSamplingRate)
-}
-
-func newTaggedStat(Name string, StatType string, tags Tags, samplingRate float32) (rStats RudderStats) {
-	tagStr := StatType
-	for tagName, tagVal := range tags {
-		tagName = strings.ReplaceAll(tagName, ":", "-")
-		tagStr += fmt.Sprintf(`|%s|%s`, tagName, tagVal)
+func (s *statsdStats) getNewStatsdClientWithExpoBackoff(ctx context.Context, opts ...statsd.Option) (*statsd.Client, error) {
+	bo := backoff.NewExponentialBackOff()
+	bo.MaxInterval = time.Minute
+	bo.MaxElapsedTime = 0
+	boCtx := backoff.WithContext(bo, ctx)
+	var err error
+	var c *statsd.Client
+	op := func() error {
+		c, err = statsd.New(opts...)
+		if err != nil {
+			s.log.Errorf("error while setting statsd client: %v", err)
+		}
+		return err
 	}
 
-	taggedClientsMapLock.RLock()
-	taggedClient, found := taggedClientsMap[tagStr]
-	taggedClientsMapLock.RUnlock()
+	err = backoff.Retry(op, boCtx)
+	return c, err
+}
+
+func (s *statsdStats) collectPeriodicStats() {
+	gaugeFunc := func(key string, val uint64) {
+		s.state.client.statsd.Gauge("runtime_"+key, val)
+	}
+	s.state.rc = newRuntimeStatsCollector(gaugeFunc)
+	s.state.rc.PauseDur = time.Duration(s.conf.periodic.statsCollectionInterval) * time.Second
+	s.state.rc.EnableCPU = s.conf.periodic.enableCPUStats
+	s.state.rc.EnableMem = s.conf.periodic.enableMemStats
+	s.state.rc.EnableGC = s.conf.periodic.enableGCStats
+
+	s.state.mc = newMetricStatsCollector(s, s.conf.periodic.metricManager)
+	if s.conf.periodic.enabled {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			s.state.rc.run()
+		}()
+		go func() {
+			defer wg.Done()
+			s.state.mc.run()
+		}()
+		wg.Wait()
+	}
+}
+
+// Stop stops periodic collection of stats.
+func (s *statsdStats) Stop() {
+	s.state.clientsLock.RLock()
+	defer s.state.clientsLock.RUnlock()
+	if !s.conf.enabled || !s.state.connEstablished {
+		return
+	}
+	if s.state.rc.done != nil {
+		close(s.state.rc.done)
+	}
+	if s.state.mc.done != nil {
+		close(s.state.mc.done)
+	}
+}
+
+// NewStat creates a new Measurement with provided Name and Type
+func (s *statsdStats) NewStat(name, statType string) (m Measurement) {
+	return newStatsdMeasurement(s.conf, s.log, name, statType, s.state.client)
+}
+
+func (s *statsdStats) NewTaggedStat(Name, StatType string, tags Tags) (m Measurement) {
+	return s.internalNewTaggedStat(Name, StatType, tags, 1)
+}
+
+func (s *statsdStats) NewSampledTaggedStat(Name, StatType string, tags Tags) (m Measurement) {
+	return s.internalNewTaggedStat(Name, StatType, tags, s.conf.samplingRate)
+}
+
+func (s *statsdStats) internalNewTaggedStat(name, statType string, tags Tags, samplingRate float32) (m Measurement) {
+	// If stats is not enabled, returning a dummy struct
+	if !s.conf.enabled {
+		return newStatsdMeasurement(s.conf, s.log, name, statType, &statsdClient{})
+	}
+
+	// Clean up tags based on deployment type. No need to send workspace id tag for free tier customers.
+	for _, excludedTag := range s.conf.excludedTags {
+		delete(tags, excludedTag)
+	}
+	if tags == nil {
+		tags = make(Tags)
+	}
+	if v, ok := tags[""]; ok {
+		s.log.Warnf("removing empty tag key with value %s for measurement %s", v, name)
+		delete(tags, "")
+	}
+	// key comprises of the measurement type plus all tag-value pairs
+	taggedClientKey := tags.String() + fmt.Sprintf("%f", samplingRate)
+
+	s.state.clientsLock.RLock()
+	taggedClient, found := s.state.clients[taggedClientKey]
+	s.state.clientsLock.RUnlock()
 
 	if !found {
-		taggedClientsMapLock.Lock()
-		tagVals := make([]string, 0, len(tags)*2)
-		for tagName, tagVal := range tags {
-			tagName = strings.ReplaceAll(tagName, ":", "-")
-			tagVal = strings.ReplaceAll(tagVal, ":", "-")
-			tagVals = append(tagVals, tagName, tagVal)
+		s.state.clientsLock.Lock()
+		if taggedClient, found = s.state.clients[taggedClientKey]; !found { // double check for race
+			tagVals := tags.Strings()
+			taggedClient = &statsdClient{samplingRate: samplingRate, tags: tagVals}
+			if s.state.connEstablished {
+				taggedClient.statsd = s.state.client.statsd.Clone(s.state.conn, s.conf.statsdTagsFormat(), s.conf.statsdDefaultTags(), statsd.Tags(tagVals...), statsd.SampleRate(samplingRate))
+			} else {
+				// new statsd clients will be created when connection is established for all pending clients
+				s.state.pendingClients[taggedClientKey] = taggedClient
+			}
+			s.state.clients[taggedClientKey] = taggedClient
 		}
-		var err error
-		taggedClient, err = statsd.New(conn, statsd.TagsFormat(getTagsFormat()), defaultTags(), statsd.Tags(tagVals...), statsd.SampleRate(samplingRate))
-		taggedClientsMap[tagStr] = taggedClient
-		taggedClientsMapLock.Unlock()
-		if err != nil {
-			pkgLogger.Error(err)
-		}
+		s.state.clientsLock.Unlock()
 	}
 
-	return &RudderStatsT{
-		Name:        Name,
-		StatType:    StatType,
-		Client:      taggedClient,
-		dontProcess: false,
-	}
-}
-
-func NewTaggedStat(Name string, StatType string, tags Tags) (rStats RudderStats) {
-	return DefaultStats.NewTaggedStat(Name, StatType, tags)
-}
-
-// Count increases the stat by n. Only applies to CountType stats
-func (rStats *RudderStatsT) Count(n int) {
-	if !statsEnabled || rStats.dontProcess {
-		return
-	}
-	if rStats.StatType != CountType {
-		panic(fmt.Errorf("rStats.StatType:%s is not count", rStats.StatType))
-	}
-	rStats.Client.Count(rStats.Name, n)
-}
-
-// Increment increases the stat by 1. Is the Equivalent of Count(1). Only applies to CountType stats
-func (rStats *RudderStatsT) Increment() {
-	if !statsEnabled || rStats.dontProcess {
-		return
-	}
-	if rStats.StatType != CountType {
-		panic(fmt.Errorf("rStats.StatType:%s is not count", rStats.StatType))
-	}
-	rStats.Client.Increment(rStats.Name)
-}
-
-// Gauge records an absolute value for this stat. Only applies to GaugeType stats
-func (rStats *RudderStatsT) Gauge(value interface{}) {
-	if !statsEnabled || rStats.dontProcess {
-		return
-	}
-	if rStats.StatType != GaugeType {
-		panic(fmt.Errorf("rStats.StatType:%s is not gauge", rStats.StatType))
-	}
-	rStats.Client.Gauge(rStats.Name, value)
-}
-
-// Start starts a new timing for this stat. Only applies to TimerType stats
-func (rStats *RudderStatsT) Start() {
-	if !statsEnabled || rStats.dontProcess {
-		return
-	}
-	if rStats.StatType != TimerType {
-		panic(fmt.Errorf("rStats.StatType:%s is not timer", rStats.StatType))
-	}
-	rStats.Timing = rStats.Client.NewTiming()
-}
-
-// End send the time elapsed since the Start()  call of this stat. Only applies to TimerType stats
-func (rStats *RudderStatsT) End() {
-	if !statsEnabled || rStats.dontProcess {
-		return
-	}
-	if rStats.StatType != TimerType {
-		panic(fmt.Errorf("rStats.StatType:%s is not timer", rStats.StatType))
-	}
-	rStats.Timing.Send(rStats.Name)
-}
-
-func (rStats *RudderStatsT) DeferredTimer() {
-	if !statsEnabled || rStats.dontProcess {
-		return
-	}
-	rStats.Client.NewTiming().Send(rStats.Name)
-}
-
-// Timing sends a timing for this stat. Only applies to TimerType stats
-func (rStats *RudderStatsT) SendTiming(duration time.Duration) {
-	if !statsEnabled || rStats.dontProcess {
-		return
-	}
-	if rStats.StatType != TimerType {
-		panic(fmt.Errorf("rStats.StatType:%s is not timer", rStats.StatType))
-	}
-	rStats.Client.Timing(rStats.Name, int(duration/time.Millisecond))
-}
-
-func collectRuntimeStats(client *statsd.Client) {
-	gaugeFunc := func(key string, val uint64) {
-		client.Gauge("runtime_"+key, val)
-	}
-	rc = newRuntimeStatsCollector(gaugeFunc)
-	rc.PauseDur = time.Duration(statsCollectionInterval) * time.Second
-	rc.EnableCPU = enableCPUStats
-	rc.EnableMem = enableMemStats
-	rc.EnableGC = enableGCStats
-	if enabled {
-		rc.run()
-	}
-
-}
-
-// StopRuntimeStats stops collection of runtime stats.
-func StopRuntimeStats() {
-	close(rc.Done)
-}
-
-func getTagsFormat() statsd.TagFormat {
-	switch statsTagsFormat {
-	case "datadog":
-		return statsd.Datadog
-	case "influxdb":
-		return statsd.InfluxDB
-	default:
-		return statsd.InfluxDB
-	}
-}
-
-// returns default Tags to the telegraf request
-func defaultTags() statsd.Option {
-	if len(config.GetKubeNamespace()) > 0 {
-		return statsd.Tags("instanceName", instanceID, "namespace", config.GetKubeNamespace())
-	}
-	return statsd.Tags("instanceName", instanceID)
+	return newStatsdMeasurement(s.conf, s.log, name, statType, taggedClient)
 }

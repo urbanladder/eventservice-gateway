@@ -3,13 +3,19 @@ package googlepubsub
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"cloud.google.com/go/pubsub"
+	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
+	"github.com/rudderlabs/rudder-server/services/streammanager/common"
+	"github.com/rudderlabs/rudder-server/utils/googleutils"
 	"github.com/rudderlabs/rudder-server/utils/logger"
 	"github.com/tidwall/gjson"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
 
@@ -17,24 +23,33 @@ type Config struct {
 	Credentials     string              `json:"credentials"`
 	ProjectId       string              `json:"projectId"`
 	EventToTopicMap []map[string]string `json:"eventToTopicMap"`
+	TestConfig      TestConfig          `json:"testConfig"`
 }
 
+type TestConfig struct {
+	Endpoint string `json:"endpoint"`
+}
 type PubsubClient struct {
-	Pbs      *pubsub.Client
-	TopicMap map[string]*pubsub.Topic
+	pbs      *pubsub.Client
+	topicMap map[string]*pubsub.Topic
+	opts     common.Opts
 }
 
-var pkgLogger logger.LoggerI
+var pkgLogger logger.Logger
 
 func init() {
 	pkgLogger = logger.NewLogger().Child("streammanager").Child("googlepubsub")
 }
 
+type GooglePubSubProducer struct {
+	client *PubsubClient
+}
+
 // NewProducer creates a producer based on destination config
-func NewProducer(destinationConfig interface{}) (*PubsubClient, error) {
+func NewProducer(destination *backendconfig.DestinationT, o common.Opts) (*GooglePubSubProducer, error) {
 	var config Config
 	ctx := context.Background()
-	jsonConfig, err := json.Marshal(destinationConfig)
+	jsonConfig, err := json.Marshal(destination.Config)
 	if err != nil {
 		return nil, fmt.Errorf("[GooglePubSub] Error while marshalling destination config :: %w", err)
 	}
@@ -42,31 +57,48 @@ func NewProducer(destinationConfig interface{}) (*PubsubClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("[GooglePubSub] error  :: error in GooglePubSub while unmarshelling destination config:: %w", err)
 	}
-	var client *pubsub.Client
-	if config.Credentials != "" && config.ProjectId != "" {
-		client, err = pubsub.NewClient(ctx, config.ProjectId, option.WithCredentialsJSON([]byte(config.Credentials)))
+	if config.ProjectId == "" {
+		return nil, fmt.Errorf("invalid configuration provided, missing projectId")
 	}
-	if err != nil {
+	var client *pubsub.Client
+	var options []option.ClientOption
+	if config.TestConfig.Endpoint != "" { // Normal configuration requires credentials
+		opts := []option.ClientOption{
+			option.WithoutAuthentication(),
+			option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
+			option.WithEndpoint(config.TestConfig.Endpoint),
+		}
+		options = append(options, opts...)
+	} else if !googleutils.ShouldSkipCredentialsInit(config.Credentials) { // Test configuration requires a custom endpoint
+		credsBytes := []byte(config.Credentials)
+		if err = googleutils.CompatibleGoogleCredentialsJSON(credsBytes); err != nil {
+			return nil, err
+		}
+		options = append(options, option.WithCredentialsJSON(credsBytes))
+	}
+	if client, err = pubsub.NewClient(ctx, config.ProjectId, options...); err != nil {
 		return nil, err
 	}
-	var topicMap = make(map[string]*pubsub.Topic, len(config.EventToTopicMap))
+	topicMap := make(map[string]*pubsub.Topic, len(config.EventToTopicMap))
 	for _, s := range config.EventToTopicMap {
 		topic := client.Topic(s["to"])
 		topic.PublishSettings.DelayThreshold = 0
 		topicMap[s["to"]] = topic
 	}
-	pbsClient := &PubsubClient{client, topicMap}
-	return pbsClient, nil
+	return &GooglePubSubProducer{client: &PubsubClient{client, topicMap, o}}, nil
 }
-func Produce(jsonData json.RawMessage, producer interface{}, destConfig interface{}) (statusCode int, respStatus string, responseMessage string) {
+
+func (producer *GooglePubSubProducer) Produce(jsonData json.RawMessage, _ interface{}) (statusCode int, respStatus, responseMessage string) {
 	parsedJSON := gjson.ParseBytes(jsonData)
-	pbs, ok := producer.(*PubsubClient)
-	ctx := context.Background()
-	if !ok {
+	pbs := producer.client
+	if pbs == nil {
 		respStatus = "Failure"
 		responseMessage = "[GooglePubSub] error :: Could not create producer"
 		return 400, respStatus, responseMessage
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), pbs.opts.Timeout)
+	defer cancel()
+
 	var data interface{}
 	if parsedJSON.Get("message").Value() != nil {
 		data = parsedJSON.Get("message").Value()
@@ -76,7 +108,6 @@ func Produce(jsonData json.RawMessage, producer interface{}, destConfig interfac
 		return 400, respStatus, responseMessage
 	}
 	value, err := json.Marshal(data)
-
 	if err != nil {
 		respStatus = "Failure"
 		responseMessage = "[GooglePubSub] error  :: " + err.Error()
@@ -84,65 +115,91 @@ func Produce(jsonData json.RawMessage, producer interface{}, destConfig interfac
 		statusCode := 400
 		return statusCode, respStatus, responseMessage
 	}
-	if parsedJSON.Get("topicId").Value() != nil {
-		topicIdString, ok := parsedJSON.Get("topicId").Value().(string)
-		if !ok {
-			respStatus = "Failure"
-			responseMessage = "[GooglePubSub] error :: Could not parse topic id to string"
-			pkgLogger.Error(responseMessage)
-			statusCode := 400
-			return statusCode, respStatus, responseMessage
-		}
-		if topicIdString == "" {
-			respStatus = "Failure"
-			responseMessage = "[GooglePubSub] error :: empty topic id string"
-			return 400, respStatus, responseMessage
-		}
-		topic := pbs.TopicMap[topicIdString]
-		if topic == nil {
-			statusCode = 400
-			responseMessage = "[GooglePubSub] error :: Topic not found in project"
-			respStatus = "Failure"
-			return statusCode, respStatus, responseMessage
-		}
-		result := topic.Publish(ctx, &pubsub.Message{Data: []byte(value)})
-		serverID, err := result.Get(ctx)
-		if err != nil {
-			statusCode = getError(err)
-			responseMessage = "[GooglePubSub] error :: Failed to publish:" + err.Error()
-			respStatus = "Failure"
-			return statusCode, respStatus, responseMessage
-		} else {
-			responseMessage = "Message publish with serverID" + serverID
-		}
-		respStatus = "Success"
-		return 200, respStatus, responseMessage
-	} else {
+
+	if parsedJSON.Get("topicId").Value() == nil {
 		respStatus = "Failure"
 		responseMessage = "[GooglePubSub] error  :: Topic Id not found"
 		return 400, respStatus, responseMessage
 	}
-}
-
-//CloseProducer closes a given producer
-func CloseProducer(producer interface{}) error {
-	pbs, ok := producer.(*PubsubClient)
-	if ok {
-		var err error
-		if pbs != nil {
-			for _, s := range pbs.TopicMap {
-				s.Stop()
-			}
-			err := pbs.Pbs.Close()
-			if err != nil {
-				pkgLogger.Errorf("error in closing Google Pub/Sub producer: %s", err.Error())
-			}
-		}
-		return err
+	topicIdString, ok := parsedJSON.Get("topicId").Value().(string)
+	if !ok {
+		respStatus = "Failure"
+		responseMessage = "[GooglePubSub] error :: Could not parse topic id to string"
+		pkgLogger.Error(responseMessage)
+		statusCode := 400
+		return statusCode, respStatus, responseMessage
 	}
-	return fmt.Errorf("error while closing producer")
+	if topicIdString == "" {
+		respStatus = "Failure"
+		responseMessage = "[GooglePubSub] error :: empty topic id string"
+		return 400, respStatus, responseMessage
+	}
+	topic := pbs.topicMap[topicIdString]
+	if topic == nil {
+		statusCode = 400
+		responseMessage = "[GooglePubSub] error :: Topic not found in project"
+		respStatus = "Failure"
+		return statusCode, respStatus, responseMessage
+	}
 
+	attributes := parsedJSON.Get("attributes").Map()
+	var result *pubsub.PublishResult
+
+	if len(attributes) != 0 {
+		attributesMap := make(map[string]string)
+		for k, v := range attributes {
+			attributesMap[k] = v.Str
+		}
+		result = topic.Publish(
+			ctx,
+			&pubsub.Message{
+				Data:       value,
+				Attributes: attributesMap,
+			},
+		)
+	} else {
+		result = topic.Publish(
+			ctx,
+			&pubsub.Message{
+				Data: value,
+			},
+		)
+	}
+
+	serverID, err := result.Get(ctx)
+
+	if err != nil {
+		if ctx.Err() != nil && errors.Is(err, context.DeadlineExceeded) {
+			statusCode = 504
+		} else {
+			statusCode = getError(err)
+		}
+		responseMessage = "[GooglePubSub] error :: Failed to publish:" + err.Error()
+		respStatus = "Failure"
+		return statusCode, respStatus, responseMessage
+	} else {
+		responseMessage = "Message publish with serverID" + serverID
+	}
+	respStatus = "Success"
+	return 200, respStatus, responseMessage
 }
+
+// Close closes a given producer
+func (producer *GooglePubSubProducer) Close() error {
+	var err error
+	client := producer.client
+	if client != nil {
+		for _, s := range client.topicMap {
+			s.Stop()
+		}
+		err := client.pbs.Close()
+		if err != nil {
+			pkgLogger.Errorf("error in closing Google Pub/Sub producer: %s", err.Error())
+		}
+	}
+	return err
+}
+
 func getError(err error) (statusCode int) {
 	switch status.Code(err) {
 	case codes.Canceled:

@@ -19,6 +19,7 @@ type ConnHandler struct {
 func (cm *ConnectionManager) establishConnection() (*ConnHandler, error) {
 	var conn net.Conn
 	var err error
+	cm.Logger.Infof(`Establishing connection to %s using TLS:%v`, cm.url, cm.UseTLS)
 	if cm.UseTLS {
 		conn, err = tls.Dial("tcp", cm.url, &tls.Config{})
 	} else {
@@ -48,7 +49,7 @@ func (cm *ConnectionManager) establishConnection() (*ConnHandler, error) {
 }
 
 func (c *ConnHandler) ServeOnConnection() error {
-	c.logger.Info(fmt.Sprintf("starting grpc server"))
+	c.logger.Info("starting grpc server")
 	if err := c.GRPCServer.Serve(c.YamuxSess); err != nil {
 		return fmt.Errorf("failed to serve grpc: %w", err)
 	}
@@ -57,7 +58,7 @@ func (c *ConnHandler) ServeOnConnection() error {
 }
 
 func (c *ConnHandler) Close() error {
-	c.logger.Info(fmt.Sprintf("closing grpc connection"))
+	c.logger.Info("closing grpc connection")
 	c.GRPCServer.GracefulStop()
 	if err := c.YamuxSess.Close(); err != nil {
 		return fmt.Errorf("failed to close grpc: %w", err)

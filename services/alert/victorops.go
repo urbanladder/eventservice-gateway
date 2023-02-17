@@ -4,19 +4,22 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
+	"time"
+
+	"github.com/rudderlabs/rudder-server/config"
+	"github.com/rudderlabs/rudder-server/utils/httputil"
 )
 
 func (ops *VictorOps) Alert(message string) {
-
 	event := map[string]interface{}{
 		"message_type":  "CRITICAL",
 		"entity_id":     ops.instanceName,
 		"state_message": message,
 	}
 	eventJSON, _ := json.Marshal(event)
-	client := &http.Client{}
+	client := &http.Client{Timeout: config.GetDuration("HttpClient.victorops.timeout", 30, time.Second)}
 	victorOpsUrl := fmt.Sprintf("https://alert.victorops.com/integrations/generic/20131114/alert/%s/rudderRecovery", ops.routingKey)
 	resp, err := client.Post(victorOpsUrl, "application/json", bytes.NewBuffer(eventJSON))
 	// Not handling errors when sending alert to victorops
@@ -29,8 +32,8 @@ func (ops *VictorOps) Alert(message string) {
 		pkgLogger.Errorf("Alert: Got error response %d", resp.StatusCode)
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
-	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	defer func() { httputil.CloseResponse(resp) }()
 	if err != nil {
 		pkgLogger.Errorf("Alert: Failed to read response body: %s", err.Error())
 		return

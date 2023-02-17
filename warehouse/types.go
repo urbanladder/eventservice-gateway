@@ -1,56 +1,48 @@
 package warehouse
 
 import (
-	"encoding/json"
 	"sync"
 	"time"
 
 	"github.com/rudderlabs/rudder-server/utils/misc"
+	"github.com/rudderlabs/rudder-server/warehouse/internal/model"
 	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
 )
 
-type PayloadT struct {
-	BatchID             string
-	UploadID            int64
-	StagingFileID       int64
-	StagingFileLocation string
-	Schema              map[string]map[string]string
-	SourceID            string
-	SourceName          string
-	DestinationID       string
-	DestinationName     string
-	DestinationType     string
-	DestinationConfig   interface{}
-	UniqueLoadGenID     string
-	Output              []loadFileUploadOutputT
-}
-
-type ProcessStagingFilesJobT struct {
-	Upload    UploadT
-	List      []*StagingFileT
-	Warehouse warehouseutils.WarehouseT
+type Payload struct {
+	BatchID                      string
+	UploadID                     int64
+	StagingFileID                int64
+	StagingFileLocation          string
+	UploadSchema                 map[string]map[string]string
+	WorkspaceID                  string
+	SourceID                     string
+	SourceName                   string
+	DestinationID                string
+	DestinationName              string
+	DestinationType              string
+	DestinationNamespace         string
+	DestinationRevisionID        string
+	StagingDestinationRevisionID string
+	DestinationConfig            map[string]interface{}
+	StagingDestinationConfig     interface{}
+	UseRudderStorage             bool
+	StagingUseRudderStorage      bool
+	UniqueLoadGenID              string
+	RudderStoragePrefix          string
+	Output                       []loadFileUploadOutputT
+	LoadFilePrefix               string // prefix for the load file name
+	LoadFileType                 string
 }
 
 type LoadFileJobT struct {
-	Upload                     UploadT
-	StagingFile                *StagingFileT
+	StagingFile                *model.StagingFile
 	Schema                     map[string]map[string]string
-	Warehouse                  warehouseutils.WarehouseT
+	Warehouse                  warehouseutils.Warehouse
 	Wg                         *misc.WaitGroup
 	LoadFileIDsChan            chan []int64
 	TableToBucketFolderMap     map[string]string
 	TableToBucketFolderMapLock *sync.RWMutex
-}
-
-type StagingFileT struct {
-	ID           int64
-	Location     string
-	SourceID     string
-	Schema       json.RawMessage
-	Status       string // enum
-	CreatedAt    time.Time
-	FirstEventAt time.Time
-	LastEventAt  time.Time
 }
 
 type BatchRouterEventT struct {
@@ -69,7 +61,7 @@ type MetadataT struct {
 
 type DataT map[string]interface{}
 
-type ColumnInfoT struct {
-	ColumnVal  interface{}
-	ColumnType string
+type FilterClause struct {
+	Clause    string
+	ClauseArg interface{}
 }
