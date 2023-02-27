@@ -1,4 +1,4 @@
-FROM 540798973460.dkr.ecr.us-east-1.amazonaws.com/golang_base:latest
+FROM ${BASE_IMAGE_REPO_URL}/golang_base:latest
 
 RUN apk add --update go git build-base
 #RUN go get github.com/onsi/ginkgo/ginkgo
