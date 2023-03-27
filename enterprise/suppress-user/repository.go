@@ -3,11 +3,10 @@ package suppression
 import (
 	"io"
 
-	"github.com/rudderlabs/rudder-go-kit/logger"
-	"github.com/rudderlabs/rudder-go-kit/stats"
 	"github.com/rudderlabs/rudder-server/enterprise/suppress-user/internal/badgerdb"
 	"github.com/rudderlabs/rudder-server/enterprise/suppress-user/internal/memory"
 	"github.com/rudderlabs/rudder-server/enterprise/suppress-user/model"
+	"github.com/rudderlabs/rudder-server/utils/logger"
 )
 
 // Repository provides a generic interface for managing user suppressions
@@ -43,5 +42,5 @@ var (
 
 // NewBadgerRepository returns a new repository backed by badgerDB.
 func NewBadgerRepository(path string, log logger.Logger, opts ...badgerdb.Opt) (Repository, error) {
-	return badgerdb.NewRepository(path, log, stats.Default, opts...)
+	return badgerdb.NewRepository(path, log, opts...)
 }
