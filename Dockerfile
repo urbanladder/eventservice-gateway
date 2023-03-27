@@ -53,13 +53,11 @@ COPY --from=builder app/build/wait-for-go/wait-for-go .
 COPY --from=builder app/build/regulation-worker .
 COPY --from=builder app/devtool .
 
-COPY build/startup.sh /
+COPY build/docker-entrypoint.sh /
 COPY build/wait-for /
 COPY ./rudder-cli/rudder-cli.linux.x86_64 /usr/bin/rudder-cli
 COPY scripts/generate-event /scripts/generate-event
 COPY scripts/batch.json /scripts/batch.json
 
-ENTRYPOINT ["/startup.sh"]
-
-# ENTRYPOINT ["/docker-entrypoint.sh"]
+ENTRYPOINT ["/docker-entrypoint.sh"]
 CMD ["/rudder-server"]
