@@ -10,12 +10,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rudderlabs/rudder-go-kit/config"
-	"github.com/rudderlabs/rudder-go-kit/logger"
-	"github.com/rudderlabs/rudder-go-kit/stats"
-	"github.com/rudderlabs/rudder-go-kit/stats/metric"
+	"github.com/rudderlabs/rudder-server/config"
 	"github.com/rudderlabs/rudder-server/jobsdb"
-	"github.com/rudderlabs/rudder-server/services/rmetrics"
+	"github.com/rudderlabs/rudder-server/services/metric"
+	"github.com/rudderlabs/rudder-server/services/stats"
+	"github.com/rudderlabs/rudder-server/utils/logger"
 	"github.com/rudderlabs/rudder-server/utils/misc"
 )
 
@@ -74,7 +73,7 @@ func (t *Stats) Start() error {
 
 		for workspace := range pileUpStatMap {
 			for destType, jobCount := range pileUpStatMap[workspace] {
-				rmetrics.IncreasePendingEvents(
+				metric.IncreasePendingEvents(
 					dbPrefix,
 					workspace,
 					destType,
@@ -177,7 +176,7 @@ func (t *Stats) ReportProcLoopAddStats(stats map[string]map[string]int, dbPrefix
 				t.routerInputRates[dbPrefix][key][destType] = metric.NewMovingAverage()
 			}
 			t.routerInputRates[dbPrefix][key][destType].Add((float64(stats[key][destType]) * float64(time.Second)) / float64(timeTaken))
-			rmetrics.IncreasePendingEvents(dbPrefix, key, destType, float64(stats[key][destType]))
+			metric.IncreasePendingEvents(dbPrefix, key, destType, float64(stats[key][destType]))
 		}
 	}
 	for workspaceKey := range t.routerInputRates[dbPrefix] {
@@ -225,14 +224,14 @@ func (t *Stats) GetRouterPickupJobs(destType string, noOfWorkers int, routerTime
 
 				if runningJobCount <= 0 || runningTimeCounter <= 0 {
 					// Adding BETA
-					if rmetrics.PendingEvents("rt", workspaceKey, destType).Value() > 0 {
+					if metric.PendingEvents("rt", workspaceKey, destType).Value() > 0 {
 						workspacePickUpCount[workspaceKey] = 1
 					}
 					continue
 				}
 				// TODO : Get rid of unReliableLatencyORInRate hack
 				unReliableLatencyORInRate := false
-				pendingEvents := rmetrics.PendingEvents("rt", workspaceKey, destType).IntValue()
+				pendingEvents := metric.PendingEvents("rt", workspaceKey, destType).IntValue()
 				if t.routerTenantLatencyStat[destType][workspaceKey].Value() != 0 {
 					tmpPickCount := int(math.Min(destTypeCount.Value()*float64(routerTimeOut)/float64(time.Second), runningTimeCounter/(t.routerTenantLatencyStat[destType][workspaceKey].Value())))
 					if tmpPickCount < 1 {
@@ -264,7 +263,7 @@ func (t *Stats) GetRouterPickupJobs(destType string, noOfWorkers int, routerTime
 	secondaryScores := t.getSortedWorkspaceSecondaryScoreList(workspacesWithJobs, workspacePickUpCount, destType, t.routerTenantLatencyStat[destType])
 	for _, scoredWorkspace := range secondaryScores {
 		workspaceKey := scoredWorkspace.workspaceId
-		pendingEvents := rmetrics.PendingEvents("rt", workspaceKey, destType).IntValue()
+		pendingEvents := metric.PendingEvents("rt", workspaceKey, destType).IntValue()
 		if pendingEvents <= 0 {
 			continue
 		}
@@ -320,7 +319,7 @@ func (t *Stats) getLastDrainedTimestamp(workspaceKey, destType string) time.Time
 func getWorkspacesWithPendingJobs(destType string, latencyMap map[string]metric.MovingAverage) []string {
 	workspacesWithJobs := make([]string, 0)
 	for workspaceKey := range latencyMap {
-		val := rmetrics.PendingEvents("rt", workspaceKey, destType).IntValue()
+		val := metric.PendingEvents("rt", workspaceKey, destType).IntValue()
 		if val > 0 {
 			workspacesWithJobs = append(workspacesWithJobs, workspaceKey)
 		} else if val < 0 {
@@ -383,7 +382,7 @@ func (t *Stats) getSortedWorkspaceSecondaryScoreList(workspacesWithJobs []string
 	for i, workspaceKey := range workspacesWithJobs {
 		scores[i] = workspaceScore{}
 		scores[i].workspaceId = workspaceKey
-		pendingEvents := rmetrics.PendingEvents("rt", workspaceKey, destType).IntValue()
+		pendingEvents := metric.PendingEvents("rt", workspaceKey, destType).IntValue()
 		if pendingEvents-workspacePickUpCount[workspaceKey] <= 0 {
 			scores[i].score = math.MaxFloat64
 			scores[i].secondaryScore = 0

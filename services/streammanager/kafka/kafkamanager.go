@@ -1,10 +1,8 @@
 package kafka
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,15 +11,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/linkedin/goavro/v2"
+	"github.com/linkedin/goavro"
 	"github.com/tidwall/gjson"
 
-	"github.com/rudderlabs/rudder-go-kit/config"
-	rslogger "github.com/rudderlabs/rudder-go-kit/logger"
-	"github.com/rudderlabs/rudder-go-kit/stats"
-	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
+	"github.com/rudderlabs/rudder-server/config"
+	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
+	"github.com/rudderlabs/rudder-server/services/stats"
 	"github.com/rudderlabs/rudder-server/services/streammanager/common"
 	"github.com/rudderlabs/rudder-server/services/streammanager/kafka/client"
+	rslogger "github.com/rudderlabs/rudder-server/utils/logger"
 )
 
 // schema is the AVRO schema required to convert the data to AVRO
@@ -118,7 +116,6 @@ type producerManager interface {
 	io.Closer
 	publisher
 	getTimeout() time.Duration
-	getEmbedAvroSchemaID() bool
 	getCodecs() map[string]*goavro.Codec
 }
 
@@ -128,10 +125,9 @@ type internalProducer interface {
 }
 
 type ProducerManager struct {
-	p                 internalProducer
-	timeout           time.Duration
-	embedAvroSchemaID bool
-	codecs            map[string]*goavro.Codec
+	p       internalProducer
+	timeout time.Duration
+	codecs  map[string]*goavro.Codec
 }
 
 func (p *ProducerManager) getTimeout() time.Duration {
@@ -141,8 +137,9 @@ func (p *ProducerManager) getTimeout() time.Duration {
 	return p.timeout
 }
 
-func (p *ProducerManager) getCodecs() map[string]*goavro.Codec { return p.codecs }
-func (p *ProducerManager) getEmbedAvroSchemaID() bool          { return p.embedAvroSchemaID }
+func (p *ProducerManager) getCodecs() map[string]*goavro.Codec {
+	return p.codecs
+}
 
 type logger interface {
 	Error(args ...interface{})
@@ -332,15 +329,7 @@ func NewProducer(destination *backendconfig.DestinationT, o common.Opts) (*Produ
 	if err != nil {
 		return nil, err
 	}
-
-	// @TODO embedAvroSchemaID should come from control plane (i.e. destination config)
-	embedAvroSchemaID := config.GetBool("ROUTER_KAFKA_EMBED_AVRO_SCHEMA_ID_"+strings.ToUpper(destination.ID), false)
-	return &ProducerManager{
-		p:                 p,
-		timeout:           o.Timeout,
-		embedAvroSchemaID: embedAvroSchemaID,
-		codecs:            codecs,
-	}, nil
+	return &ProducerManager{p: p, timeout: o.Timeout, codecs: codecs}, nil
 }
 
 // NewProducerForAzureEventHubs creates a producer for Azure event hub based on destination config
@@ -463,52 +452,16 @@ func prepareMessage(topic, key string, message []byte, timestamp time.Time) clie
 // It iterates over the schemas provided by the customer and tries to serialize the data.
 // If it's able to serialize the data then it returns the converted data otherwise it returns an error.
 // We are using the LinkedIn goavro library for data serialization. Ref: https://github.com/linkedin/goavro
-func serializeAvroMessage(schemaID string, embedSchemaID bool, value []byte, codec goavro.Codec) ([]byte, error) {
+func serializeAvroMessage(value []byte, codec goavro.Codec) ([]byte, error) {
 	native, _, err := codec.NativeFromTextual(value)
 	if err != nil {
 		return nil, fmt.Errorf("unable convert the event to native from textual, with error: %s", err)
 	}
-	bin, err := codec.BinaryFromNative(nil, native)
+	binary, err := codec.BinaryFromNative(nil, native)
 	if err != nil {
 		return nil, fmt.Errorf("unable convert the event to binary from native, with error: %s", err)
 	}
-
-	if !embedSchemaID {
-		return bin, nil
-	}
-
-	msg, err := addAvroSchemaIDHeader(schemaID, bin)
-	if err != nil {
-		return nil, fmt.Errorf("unable to add Avro schema ID header: %v", err)
-	}
-	return msg, nil
-}
-
-func addAvroSchemaIDHeader(schemaID string, msgBytes []byte) (header []byte, err error) {
-	schemaIDInt, err := strconv.ParseInt(schemaID, 10, 32)
-	if err != nil {
-		return nil, fmt.Errorf("avro header: unable to convert schemaID %q to int: %v", schemaID, err)
-	}
-
-	var buf bytes.Buffer
-	err = buf.WriteByte(byte(0x0))
-	if err != nil {
-		return nil, fmt.Errorf("avro header: unable to write magic byte: %v", err)
-	}
-
-	idBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(idBytes, uint32(schemaIDInt))
-	_, err = buf.Write(idBytes)
-	if err != nil {
-		return nil, fmt.Errorf("avro header: unable to write schema id: %v", err)
-	}
-
-	_, err = buf.Write(msgBytes)
-	if err != nil {
-		return nil, fmt.Errorf("avro header: unable to write message bytes: %v", err)
-	}
-
-	return buf.Bytes(), nil
+	return binary, nil
 }
 
 func prepareBatchOfMessages(batch []map[string]interface{}, timestamp time.Time, p producerManager, defaultTopic string) (
@@ -556,7 +509,7 @@ func prepareBatchOfMessages(batch []map[string]interface{}, timestamp time.Time,
 				pkgLogger.Errorf("unable to find schema with schemaId: %v", schemaId)
 				continue
 			}
-			marshalledMsg, err = serializeAvroMessage(schemaId, p.getEmbedAvroSchemaID(), marshalledMsg, *codec)
+			marshalledMsg, err = serializeAvroMessage(marshalledMsg, *codec)
 			if err != nil {
 				kafkaStats.avroSerializationErr.Increment()
 				pkgLogger.Errorf("unable to serialize the event of index: %d, with error: %s", i, err)
@@ -672,7 +625,7 @@ func sendMessage(ctx context.Context, jsonData json.RawMessage, p producerManage
 		if !ok {
 			return makeErrorResponse(fmt.Errorf("unable to find schema with schemaId: %v", schemaId))
 		}
-		value, err = serializeAvroMessage(schemaId, p.getEmbedAvroSchemaID(), value, *codec)
+		value, err = serializeAvroMessage(value, *codec)
 		if err != nil {
 			return makeErrorResponse(fmt.Errorf("unable to serialize event with messageId: %s, with error %s", messageId, err))
 		}
@@ -714,7 +667,6 @@ func getStatusCodeFromError(err error) int {
 	return 400
 }
 
-// @TODO getSSHConfig should come from control plane (i.e. destination config)
 func getSSHConfig(destinationID string, c *config.Config) (*client.SSHConfig, error) {
 	enabled := c.GetString("ROUTER_KAFKA_SSH_ENABLED", "")
 	if enabled == "" {

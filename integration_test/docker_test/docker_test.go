@@ -22,7 +22,7 @@ import (
 	"time"
 
 	"github.com/rudderlabs/rudder-server/runner"
-	"github.com/rudderlabs/rudder-server/testhelper/destination/kafka"
+	"github.com/rudderlabs/rudder-server/testhelper"
 	"github.com/rudderlabs/rudder-server/testhelper/workspaceConfig"
 
 	redigo "github.com/gomodule/redigo/redis"
@@ -33,17 +33,15 @@ import (
 	"github.com/tidwall/gjson"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/rudderlabs/rudder-go-kit/config"
-	"github.com/rudderlabs/rudder-go-kit/logger"
-	kitHelper "github.com/rudderlabs/rudder-go-kit/testhelper"
-	"github.com/rudderlabs/rudder-go-kit/testhelper/docker/resource"
-	"github.com/rudderlabs/rudder-go-kit/testhelper/rand"
+	"github.com/rudderlabs/rudder-server/config"
 	kafkaClient "github.com/rudderlabs/rudder-server/services/streammanager/kafka/client"
 	"github.com/rudderlabs/rudder-server/services/streammanager/kafka/client/testutil"
 	"github.com/rudderlabs/rudder-server/testhelper/destination"
 	"github.com/rudderlabs/rudder-server/testhelper/health"
+	"github.com/rudderlabs/rudder-server/testhelper/rand"
 	whUtil "github.com/rudderlabs/rudder-server/testhelper/webhook"
 	"github.com/rudderlabs/rudder-server/utils/httputil"
+	"github.com/rudderlabs/rudder-server/utils/logger"
 	"github.com/rudderlabs/rudder-server/utils/types/deployment"
 )
 
@@ -58,9 +56,9 @@ var (
 	overrideArm64Check           bool
 	writeKey                     string
 	workspaceID                  string
-	kafkaContainer               *kafka.Resource
+	kafkaContainer               *destination.KafkaResource
 	redisContainer               *destination.RedisResource
-	postgresContainer            *resource.PostgresResource
+	postgresContainer            *destination.PostgresResource
 	transformerContainer         *destination.TransformerResource
 	minioContainer               *destination.MINIOResource
 	EventID                      string
@@ -217,7 +215,7 @@ func TestMainFlow(t *testing.T) {
 	})
 
 	t.Run("kafka", func(t *testing.T) {
-		kafkaHost := fmt.Sprintf("localhost:%s", kafkaContainer.Ports[0])
+		kafkaHost := fmt.Sprintf("localhost:%s", kafkaContainer.Port)
 
 		// Create new consumer
 		tc := testutil.New("tcp", kafkaHost)
@@ -388,23 +386,23 @@ func setupMainFlow(svcCtx context.Context, t *testing.T) <-chan struct{} {
 
 	containersGroup, containersCtx := errgroup.WithContext(context.TODO())
 	containersGroup.Go(func() (err error) {
-		kafkaContainer, err = kafka.Setup(pool, t,
-			kafka.WithLogger(&testLogger{logger.NewLogger().Child("kafka")}),
-			kafka.WithBrokers(1),
+		kafkaContainer, err = destination.SetupKafka(pool, t,
+			destination.WithLogger(&testLogger{logger.NewLogger().Child("kafka")}),
+			destination.WithBrokers(1),
 		)
 		if err != nil {
 			return err
 		}
 		kafkaCtx, kafkaCancel := context.WithTimeout(containersCtx, 3*time.Minute)
 		defer kafkaCancel()
-		return waitForKafka(kafkaCtx, t, kafkaContainer.Ports[0])
+		return waitForKafka(kafkaCtx, t, kafkaContainer.Port)
 	})
 	containersGroup.Go(func() (err error) {
 		redisContainer, err = destination.SetupRedis(containersCtx, pool, t)
 		return err
 	})
 	containersGroup.Go(func() (err error) {
-		postgresContainer, err = resource.SetupPostgres(pool, t)
+		postgresContainer, err = destination.SetupPostgres(pool, t)
 		db = postgresContainer.DB
 		return err
 	})
@@ -427,12 +425,12 @@ func setupMainFlow(svcCtx context.Context, t *testing.T) <-chan struct{} {
 	t.Setenv("DEST_TRANSFORM_URL", transformerContainer.TransformURL)
 	t.Setenv("DEPLOYMENT_TYPE", string(deployment.DedicatedType))
 
-	httpPortInt, err := kitHelper.GetFreePort()
+	httpPortInt, err := testhelper.GetFreePort()
 	require.NoError(t, err)
 
 	httpPort = strconv.Itoa(httpPortInt)
 	t.Setenv("RSERVER_GATEWAY_WEB_PORT", httpPort)
-	httpAdminPort, err := kitHelper.GetFreePort()
+	httpAdminPort, err := testhelper.GetFreePort()
 	require.NoError(t, err)
 
 	t.Setenv("RSERVER_GATEWAY_ADMIN_WEB_PORT", strconv.Itoa(httpAdminPort))
@@ -458,7 +456,7 @@ func setupMainFlow(svcCtx context.Context, t *testing.T) <-chan struct{} {
 		"minioEndpoint":                minioContainer.Endpoint,
 		"minioBucketName":              minioContainer.BucketName,
 	}
-	mapWorkspaceConfig["kafkaPort"] = kafkaContainer.Ports[0]
+	mapWorkspaceConfig["kafkaPort"] = kafkaContainer.Port
 	workspaceConfigPath := workspaceConfig.CreateTempFile(t,
 		"testdata/workspaceConfigTemplate.json",
 		mapWorkspaceConfig,
@@ -649,7 +647,7 @@ func blockOnHold(t *testing.T) {
 
 func getEvent(url, method string) (string, error) {
 	httpClient := &http.Client{}
-	req, err := http.NewRequest(method, url, http.NoBody)
+	req, err := http.NewRequest(method, url, nil)
 	if err != nil {
 		return "", err
 	}

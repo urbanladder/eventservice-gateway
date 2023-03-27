@@ -5,7 +5,7 @@ import (
 
 	"github.com/rudderlabs/rudder-server/rruntime"
 
-	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-server/config"
 )
 
 // HandleEmbeddedRecovery decides the recovery Mode in which app should run based on earlier crashes

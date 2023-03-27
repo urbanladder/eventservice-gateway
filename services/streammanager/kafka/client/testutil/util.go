@@ -109,9 +109,7 @@ func (c *Client) CreateTopic(ctx context.Context, topic string, numPartitions, r
 		return ctx.Err()
 	case err = <-errors:
 		if err != nil {
-			return fmt.Errorf("create topic: cannot create topic with controller %q and addresses %+v: %w",
-				controllerHost, c.addresses, err,
-			)
+			return fmt.Errorf("create topic: could not create topic: %w", err)
 		}
 		return nil
 	}

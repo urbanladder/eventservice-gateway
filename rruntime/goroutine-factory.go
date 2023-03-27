@@ -35,11 +35,3 @@ func GoForWarehouse(function func()) {
 		function()
 	}()
 }
-
-var GoRoutineFactory goRoutineFactory
-
-type goRoutineFactory struct{}
-
-func (goRoutineFactory) Go(function func()) {
-	Go(function)
-}

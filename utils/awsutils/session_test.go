@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
+	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
 	"github.com/stretchr/testify/assert"
 )
 

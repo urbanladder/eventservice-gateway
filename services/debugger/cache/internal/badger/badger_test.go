@@ -6,10 +6,8 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"github.com/rudderlabs/rudder-go-kit/config"
-	"github.com/rudderlabs/rudder-go-kit/logger"
-	"github.com/rudderlabs/rudder-go-kit/stats"
-	svcMetric "github.com/rudderlabs/rudder-go-kit/stats/metric"
+	"github.com/rudderlabs/rudder-server/config"
+	"github.com/rudderlabs/rudder-server/utils/logger"
 	"github.com/rudderlabs/rudder-server/utils/misc"
 	"github.com/stretchr/testify/assert"
 )
@@ -27,8 +25,7 @@ var _ = Describe("cache", func() {
 		BeforeEach(func() {
 			misc.Init()
 			config.Set("LiveEvent.cache.ttl", "1s")
-			s := stats.NewStats(config.Default, logger.Default, svcMetric.Instance)
-			e, err = New[[]byte]("test", logger.NewLogger(), s)
+			e, err = New[[]byte]("test", logger.NewLogger())
 			Expect(err).To(BeNil())
 		})
 

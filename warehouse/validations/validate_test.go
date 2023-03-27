@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/rudderlabs/rudder-go-kit/testhelper/docker/resource"
 	postgreslegacy "github.com/rudderlabs/rudder-server/warehouse/integrations/postgres-legacy"
 
 	"github.com/rudderlabs/rudder-server/warehouse/encoding"
@@ -13,7 +12,7 @@ import (
 	"github.com/rudderlabs/rudder-server/warehouse/internal/model"
 
 	"github.com/ory/dockertest/v3"
-	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
+	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
 	"github.com/rudderlabs/rudder-server/utils/misc"
 	"github.com/rudderlabs/rudder-server/warehouse/integrations/postgres"
 
@@ -26,19 +25,19 @@ import (
 
 type testResource struct {
 	minioResource *destination.MINIOResource
-	pgResource    *resource.PostgresResource
+	pgResource    *destination.PostgresResource
 }
 
 func setup(t *testing.T, pool *dockertest.Pool) testResource {
 	var (
 		minioResource *destination.MINIOResource
-		pgResource    *resource.PostgresResource
+		pgResource    *destination.PostgresResource
 		err           error
 	)
 
 	g := errgroup.Group{}
 	g.Go(func() error {
-		pgResource, err = resource.SetupPostgres(pool, t)
+		pgResource, err = destination.SetupPostgres(pool, t)
 		require.NoError(t, err)
 
 		return nil
@@ -477,7 +476,7 @@ func TestValidator(t *testing.T) {
 					"accessKeyID":     "temp-access-key",
 					"secretAccessKey": "test-secret-key",
 				},
-				wantError: errors.New("upload file: uploading file: checking bucket: The Access Key Id you provided does not exist in our records."),
+				wantError: errors.New("upload file: uploading file: The Access Key Id you provided does not exist in our records."),
 			},
 			{
 				name: "no privilege",

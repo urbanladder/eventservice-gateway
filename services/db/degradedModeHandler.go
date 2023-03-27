@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-server/config"
 )
 
 func setupDegradedMode() {

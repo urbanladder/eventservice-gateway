@@ -18,12 +18,11 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/ory/dockertest/v3"
-	"github.com/rudderlabs/rudder-go-kit/logger"
-	"github.com/rudderlabs/rudder-go-kit/stats/mock_stats"
-	"github.com/rudderlabs/rudder-go-kit/testhelper/docker/resource"
+	mock_stats "github.com/rudderlabs/rudder-server/mocks/services/stats"
 	"github.com/rudderlabs/rudder-server/services/filemanager"
 	migrator "github.com/rudderlabs/rudder-server/services/sql-migrator"
 	"github.com/rudderlabs/rudder-server/testhelper/destination"
+	"github.com/rudderlabs/rudder-server/utils/logger"
 	"github.com/rudderlabs/rudder-server/warehouse/archive"
 	"github.com/rudderlabs/rudder-server/warehouse/internal/model"
 	"github.com/rudderlabs/rudder-server/warehouse/multitenant"
@@ -64,7 +63,7 @@ func TestArchiver(t *testing.T) {
 			var (
 				prefix        = "test-prefix"
 				minioResource *destination.MINIOResource
-				pgResource    *resource.PostgresResource
+				pgResource    *destination.PostgresResource
 			)
 
 			pool, err := dockertest.NewPool("")
@@ -72,7 +71,7 @@ func TestArchiver(t *testing.T) {
 
 			g := errgroup.Group{}
 			g.Go(func() error {
-				pgResource, err = resource.SetupPostgres(pool, t)
+				pgResource, err = destination.SetupPostgres(pool, t)
 				require.NoError(t, err)
 
 				err = (&migrator.Migrator{

@@ -13,10 +13,9 @@ import (
 	"github.com/dgraph-io/badger/v3"
 
 	"github.com/google/uuid"
-	"github.com/rudderlabs/rudder-go-kit/logger"
-	"github.com/rudderlabs/rudder-go-kit/stats"
 	"github.com/rudderlabs/rudder-server/enterprise/suppress-user/internal/badgerdb"
 	"github.com/rudderlabs/rudder-server/enterprise/suppress-user/model"
+	"github.com/rudderlabs/rudder-server/utils/logger"
 	"github.com/stretchr/testify/require"
 )
 
@@ -30,7 +29,7 @@ func (f readerFunc) Read(p []byte) (n int, err error) {
 func TestBadgerRepository(t *testing.T) {
 	basePath := path.Join(t.TempDir(), strings.ReplaceAll(uuid.New().String(), "-", ""))
 	token := []byte("token")
-	repo, err := badgerdb.NewRepository(basePath, logger.NOP, stats.Default)
+	repo, err := badgerdb.NewRepository(basePath, logger.NOP)
 	require.NoError(t, err)
 
 	t.Run("trying to use a repository during restore", func(t *testing.T) {
@@ -87,7 +86,7 @@ func TestBadgerRepository(t *testing.T) {
 	defer func() { _ = repo.Stop() }()
 
 	t.Run("trying to start a second repository using the same path", func(t *testing.T) {
-		_, err := badgerdb.NewRepository(basePath, logger.NOP, stats.Default)
+		_, err := badgerdb.NewRepository(basePath, logger.NOP)
 		require.Error(t, err, "it should return an error when trying to start a second repository using the same path")
 	})
 
@@ -103,7 +102,7 @@ func TestBadgerRepository(t *testing.T) {
 
 	t.Run("new with seeder", func(t *testing.T) {
 		basePath := path.Join(t.TempDir(), "badger-test-2")
-		_, err := badgerdb.NewRepository(basePath, logger.NOP, stats.Default, badgerdb.WithSeederSource(func() (io.Reader, error) {
+		_, err := badgerdb.NewRepository(basePath, logger.NOP, badgerdb.WithSeederSource(func() (io.Reader, error) {
 			return buffer, nil
 		}), badgerdb.WithMaxSeedWait(1*time.Millisecond))
 		require.NoError(t, err)
@@ -133,7 +132,7 @@ func TestBadgerRepository(t *testing.T) {
 	})
 
 	t.Run("trying to use a closed repository", func(t *testing.T) {
-		repo, err := badgerdb.NewRepository(basePath, logger.NOP, stats.Default)
+		repo, err := badgerdb.NewRepository(basePath, logger.NOP)
 		require.NoError(t, err)
 		require.NoError(t, repo.Stop())
 

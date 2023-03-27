@@ -21,13 +21,11 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 
-	kitHelper "github.com/rudderlabs/rudder-go-kit/testhelper"
-	"github.com/rudderlabs/rudder-go-kit/testhelper/docker/resource"
-	"github.com/rudderlabs/rudder-go-kit/testhelper/rand"
 	"github.com/rudderlabs/rudder-server/app"
 	"github.com/rudderlabs/rudder-server/testhelper"
 	"github.com/rudderlabs/rudder-server/testhelper/destination"
 	"github.com/rudderlabs/rudder-server/testhelper/health"
+	"github.com/rudderlabs/rudder-server/testhelper/rand"
 	whUtil "github.com/rudderlabs/rudder-server/testhelper/webhook"
 	"github.com/rudderlabs/rudder-server/utils/httputil"
 )
@@ -51,14 +49,14 @@ func testGatewayByAppType(t *testing.T, appType string) {
 
 	var (
 		group                errgroup.Group
-		postgresContainer    *resource.PostgresResource
+		postgresContainer    *destination.PostgresResource
 		transformerContainer *destination.TransformerResource
 		serverInstanceID     = "1"
 		workspaceToken       = "workspace-token"
 	)
 
 	group.Go(func() (err error) {
-		postgresContainer, err = resource.SetupPostgres(pool, t)
+		postgresContainer, err = destination.SetupPostgres(pool, t)
 		if err != nil {
 			return fmt.Errorf("could not start postgres: %v", err)
 		}
@@ -118,11 +116,11 @@ func testGatewayByAppType(t *testing.T, appType string) {
 	t.Logf("BackendConfig server listening on: %s", backendConfigSrv.URL)
 	t.Cleanup(backendConfigSrv.Close)
 
-	httpPort, err := kitHelper.GetFreePort()
+	httpPort, err := testhelper.GetFreePort()
 	require.NoError(t, err)
-	httpAdminPort, err := kitHelper.GetFreePort()
+	httpAdminPort, err := testhelper.GetFreePort()
 	require.NoError(t, err)
-	debugPort, err := kitHelper.GetFreePort()
+	debugPort, err := testhelper.GetFreePort()
 	require.NoError(t, err)
 
 	rudderTmpDir, err := os.MkdirTemp("", "rudder_server_*_test")

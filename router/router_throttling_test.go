@@ -22,13 +22,11 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 
-	kitHelper "github.com/rudderlabs/rudder-go-kit/testhelper"
-	"github.com/rudderlabs/rudder-go-kit/testhelper/docker/resource"
-	trand "github.com/rudderlabs/rudder-go-kit/testhelper/rand"
 	"github.com/rudderlabs/rudder-server/runner"
 	"github.com/rudderlabs/rudder-server/testhelper"
 	"github.com/rudderlabs/rudder-server/testhelper/destination"
 	"github.com/rudderlabs/rudder-server/testhelper/health"
+	trand "github.com/rudderlabs/rudder-server/testhelper/rand"
 	"github.com/rudderlabs/rudder-server/utils/httputil"
 )
 
@@ -82,11 +80,11 @@ func Test_RouterThrottling(t *testing.T) {
 	require.NoError(t, err)
 	var (
 		group                errgroup.Group
-		postgresContainer    *resource.PostgresResource
+		postgresContainer    *destination.PostgresResource
 		transformerContainer *destination.TransformerResource
 	)
 	group.Go(func() (err error) {
-		postgresContainer, err = resource.SetupPostgres(pool, t)
+		postgresContainer, err = destination.SetupPostgres(pool, t)
 		return
 	})
 	group.Go(func() (err error) {
@@ -109,11 +107,11 @@ func Test_RouterThrottling(t *testing.T) {
 		"workspaceId": workspaceID,
 	})
 
-	httpPort, err := kitHelper.GetFreePort()
+	httpPort, err := testhelper.GetFreePort()
 	require.NoError(t, err)
-	httpAdminPort, err := kitHelper.GetFreePort()
+	httpAdminPort, err := testhelper.GetFreePort()
 	require.NoError(t, err)
-	debugPort, err := kitHelper.GetFreePort()
+	debugPort, err := testhelper.GetFreePort()
 	require.NoError(t, err)
 	rudderTmpDir, err := os.MkdirTemp("", "rudder_server_*_test")
 	require.NoError(t, err)

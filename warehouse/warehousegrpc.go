@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
+	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
 	proto "github.com/rudderlabs/rudder-server/proto/warehouse"
 	"github.com/rudderlabs/rudder-server/warehouse/client/controlplane"
 	"github.com/rudderlabs/rudder-server/warehouse/internal/model"

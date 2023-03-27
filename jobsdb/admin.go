@@ -5,8 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/rudderlabs/rudder-go-kit/stats/metric"
-	"github.com/rudderlabs/rudder-server/services/rmetrics"
+	"github.com/rudderlabs/rudder-server/services/metric"
 )
 
 func (jd *HandleT) Status() interface{} {
@@ -23,7 +22,7 @@ func (jd *HandleT) Status() interface{} {
 
 	pendingEventMetrics := metric.Instance.
 		GetRegistry(metric.PublishedMetrics).
-		GetMetricsByName(fmt.Sprintf(rmetrics.JobsdbPendingEventsCount, jd.tablePrefix))
+		GetMetricsByName(fmt.Sprintf(metric.JobsdbPendingEventsCount, jd.tablePrefix))
 
 	if len(pendingEventMetrics) == 0 {
 		return statusObj

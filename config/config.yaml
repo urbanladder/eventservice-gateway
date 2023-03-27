@@ -1,7 +1,7 @@
 maxProcess: 12
 enableProcessor: true
 enableRouter: true
-enableStats: true
+enableStats: false
 statsTagsFormat: influxdb
 HttpClient:
   timeout: 30s
@@ -225,10 +225,10 @@ recovery:
     duration: 300s
 Logger:
   enableConsole: true
-  enableFile: false
+  enableFile: true
   consoleJsonFormat: false
   fileJsonFormat: false
-  logFileLocation: /tmp/rudder_log.log
+  logFileLocation: log/combined.outerr.log
   logFileSize: 100
   enableTimestamp: true
   enableFileNameInLog: true
