@@ -26,5 +26,5 @@ if [ -f "beaver/beaver.conf" ] && [ $(grep -c "$appName-Section" beaver/beaver.c
 # done
 FILEPATH=/etc/rudderstack/
 aws s3 cp ${WORKSPACECONFIG_S3_URI} ${FILEPATH}/workspaceConfig.json
-goreman start
+# goreman start
 # CMD ["/rudder-server"]
