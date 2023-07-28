@@ -2910,7 +2910,7 @@ func assertDestinationTransform(
 		fmt.Println("url", url)
 		fmt.Println("destinationDefinitionName", destinationDefinitionName)
 
-		Expect(url).To(Equal(fmt.Sprintf("http://localhost:9090/v0/destinations/%s", destinationDefinitionName)))
+		Expect(url).To(Equal(fmt.Sprintf("http://localhost:9090/v1/destinations/%s", destinationDefinitionName)))
 
 		fmt.Println("clientEvents:", len(clientEvents))
 		fmt.Println("expect:", expectations.events)

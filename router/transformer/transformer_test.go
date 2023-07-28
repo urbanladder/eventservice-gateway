@@ -119,7 +119,7 @@ func TestProxyRequest(t *testing.T) {
 			destName: "good_dest_1",
 			expected: expectedResponse{
 				code:        http.StatusGatewayTimeout,
-				body:        `Post "%s/v0/destinations/good_dest_1/proxy": context deadline exceeded (Client.Timeout exceeded while awaiting headers)`,
+				body:        `Post "%s/v1/destinations/good_dest_1/proxy": context deadline exceeded (Client.Timeout exceeded while awaiting headers)`,
 				contentType: "text/plain; charset=utf-8",
 				bodyType:    STR,
 			},
@@ -153,7 +153,7 @@ func TestProxyRequest(t *testing.T) {
 			destName: "ctx_timeout_dest",
 			expected: expectedResponse{
 				code:        http.StatusGatewayTimeout,
-				body:        `Post "%s/v0/destinations/ctx_timeout_dest/proxy": context deadline exceeded`,
+				body:        `Post "%s/v1/destinations/ctx_timeout_dest/proxy": context deadline exceeded`,
 				contentType: "text/plain; charset=utf-8",
 				bodyType:    STR,
 			},
@@ -189,7 +189,7 @@ func TestProxyRequest(t *testing.T) {
 			destName: "ctx_cancel_dest",
 			expected: expectedResponse{
 				code:        http.StatusInternalServerError,
-				body:        `Post "%s/v0/destinations/ctx_cancel_dest/proxy": context canceled`,
+				body:        `Post "%s/v1/destinations/ctx_cancel_dest/proxy": context canceled`,
 				contentType: "text/plain; charset=utf-8",
 				bodyType:    STR,
 			},
@@ -224,7 +224,7 @@ func TestProxyRequest(t *testing.T) {
 			destName: "not_found_dest",
 			expected: expectedResponse{
 				code:        http.StatusNotFound,
-				body:        `post "%s/v0/destinations/not_found_dest/proxy" not found`,
+				body:        `post "%s/v1/destinations/not_found_dest/proxy" not found`,
 				contentType: "text/plain; charset=utf-8",
 				bodyType:    STR,
 			},
@@ -322,7 +322,7 @@ func TestProxyRequest(t *testing.T) {
 // A kind of mock for transformer proxy endpoint in transformer
 func mockProxyHandler(timeout time.Duration, code int, response string) *chi.Mux {
 	srvMux := chi.NewRouter()
-	srvMux.HandleFunc("/v0/destinations/{destName}/proxy", func(w http.ResponseWriter, req *http.Request) {
+	srvMux.HandleFunc("/v1/destinations/{destName}/proxy", func(w http.ResponseWriter, req *http.Request) {
 		dName := chi.URLParam(req, "destName")
 		if dName == "" {
 			// This case wouldn't occur I guess
