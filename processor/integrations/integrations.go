@@ -168,7 +168,7 @@ func GetTransformerURL() string {
 
 // GetDestinationURL returns node URL
 func GetDestinationURL(destType string) string {
-	destinationEndPoint := fmt.Sprintf("%s/v0/destinations/%s", destTransformURL, strings.ToLower(destType))
+	destinationEndPoint := fmt.Sprintf("%s/v1/destinations/%s", destTransformURL, strings.ToLower(destType)) // v0
 	if slices.Contains(warehouseutils.WarehouseDestinations, destType) {
 		whSchemaVersionQueryParam := fmt.Sprintf("whSchemaVersion=%s&whIDResolve=%v", config.GetString("Warehouse.schemaVersion", "v1"), warehouseutils.IDResolutionEnabled())
 		if destType == "RS" {
@@ -190,5 +190,5 @@ func GetUserTransformURL() string {
 
 // GetTrackingPlanValidationURL returns the port of running tracking plan validation
 func GetTrackingPlanValidationURL() string {
-	return destTransformURL + "/v0/validate"
+	return destTransformURL + "/v1/validate" // v0
 }

@@ -206,8 +206,8 @@ Dedup:
   dedupWindow: 3600s
   memOptimized: true
 BackendConfig:
-  configFromFile: false
-  configJSONPath: /etc/rudderstack/workspaceConfig.json
+  configFromFile: true
+  configJSONPath: /Users/sauparnagupta/services/workspaceConfig.json
   pollInterval: 5s
   regulationsPollInterval: 300s
   maxRegulationsPerRequest: 1000
@@ -245,7 +245,7 @@ Diagnostics:
   enableBatchRouterMetric: true
   enableDestinationFailuresMetric: true
 RuntimeStats:
-  enabled: true
+  enabled: false
   statsCollectionInterval: 10
   enableCPUStats: true
   enableMemStats: true

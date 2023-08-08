@@ -426,5 +426,5 @@ func getProxyURL(destName, baseUrl string) string {
 	if !router_utils.IsNotEmptyString(baseUrl) { // empty string check
 		baseUrl = strings.TrimSuffix(config.GetString("DEST_TRANSFORM_URL", "http://localhost:9090"), "/")
 	}
-	return baseUrl + "/v0/destinations/" + strings.ToLower(destName) + "/proxy"
+	return baseUrl + "/v1/destinations/" + strings.ToLower(destName) + "/proxy" // v0
 }
