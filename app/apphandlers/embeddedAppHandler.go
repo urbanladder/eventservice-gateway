@@ -174,15 +174,6 @@ func (a *embeddedApp) StartRudderCore(ctx context.Context, options *app.Options)
 	defer batchRouterDB.Close()
 
 	// We need two errorDBs, one in read & one in write mode to support separate gateway to store failures
-	errDBForRead := jobsdb.NewForRead(
-		"proc_error",
-		jobsdb.WithClearDB(options.ClearDB),
-		jobsdb.WithPreBackupHandlers(prebackupHandlers),
-		jobsdb.WithDSLimit(&a.config.processorDSLimit),
-		jobsdb.WithFileUploaderProvider(fileUploaderProvider),
-		jobsdb.WithSkipMaintenanceErr(config.GetBool("Processor.jobsDB.skipMaintenanceError", false)),
-	)
-	defer errDBForRead.Close()
 	errDBForWrite := jobsdb.NewForWrite(
 		"proc_error",
 		jobsdb.WithClearDB(options.ClearDB),
@@ -192,6 +183,15 @@ func (a *embeddedApp) StartRudderCore(ctx context.Context, options *app.Options)
 		return fmt.Errorf("could not start errDBForWrite: %w", err)
 	}
 	defer errDBForWrite.Stop()
+	errDBForRead := jobsdb.NewForRead(
+		"proc_error",
+		jobsdb.WithClearDB(options.ClearDB),
+		jobsdb.WithPreBackupHandlers(prebackupHandlers),
+		jobsdb.WithDSLimit(&a.config.processorDSLimit),
+		jobsdb.WithFileUploaderProvider(fileUploaderProvider),
+		jobsdb.WithSkipMaintenanceErr(config.GetBool("Processor.jobsDB.skipMaintenanceError", false)),
+	)
+	defer errDBForRead.Close()
 
 	schemaDB := jobsdb.NewForReadWrite(
 		"esch",

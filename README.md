@@ -48,6 +48,14 @@
   </b>
 </p>
 
+# Version Used: v1.11.4
+Commit ID: 51a21d8
+
+To fetch rudder trasformer. Base Commit ID from rudderlabs github is 4a38b158de4ed9c5db88d83d0578c03521c80e58
+```
+git submodule init
+git submodule update
+```
 ---
 
 As the leading open source Customer Data Platform (CDP), [**RudderStack**](https://www.rudderstack.com/) provides data pipelines that make it easy to collect data from every application, website and SaaS platform, then activate it in your warehouse and business tools.

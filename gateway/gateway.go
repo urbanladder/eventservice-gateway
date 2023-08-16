@@ -32,6 +32,7 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 
+	httpbrake "github.com/airbrake/gobrake/v5/http"
 	"github.com/rudderlabs/rudder-go-kit/chiware"
 	"github.com/rudderlabs/rudder-go-kit/config"
 	kithttputil "github.com/rudderlabs/rudder-go-kit/httputil"
@@ -47,6 +48,7 @@ import (
 	"github.com/rudderlabs/rudder-server/jobsdb"
 	"github.com/rudderlabs/rudder-server/middleware"
 	"github.com/rudderlabs/rudder-server/rruntime"
+	"github.com/rudderlabs/rudder-server/services/airbrake"
 	sourcedebugger "github.com/rudderlabs/rudder-server/services/debugger/source"
 	"github.com/rudderlabs/rudder-server/services/diagnostics"
 	"github.com/rudderlabs/rudder-server/services/rsources"
@@ -106,6 +108,7 @@ var (
 	pkgLogger                                                                         logger.Logger
 	Diagnostics                                                                       diagnostics.DiagnosticsI
 	semverRegexp                                                                      = regexp.MustCompile(`^v?([0-9]+)(\.[0-9]+)?(\.[0-9]+)?(-([0-9A-Za-z\-]+(\.[0-9A-Za-z\-]+)*))?(\+([0-9A-Za-z\-]+(\.[0-9A-Za-z\-]+)*))?$`)
+	notifier                                                                          = airbrake.Notifier
 )
 
 // CustomVal is used as a key in the jobsDB customval column
@@ -941,6 +944,7 @@ func (gateway *HandleT) webIdentifyHandler(w http.ResponseWriter, r *http.Reques
 }
 
 func (gateway *HandleT) webTrackHandler(w http.ResponseWriter, r *http.Request) {
+	defer notifier.NotifyOnPanic()
 	gateway.webHandler(w, r, "track")
 }
 
@@ -1044,6 +1048,7 @@ func (gateway *HandleT) pixelWebHandler(w http.ResponseWriter, r *http.Request, 
 }
 
 func (gateway *HandleT) webHandler(w http.ResponseWriter, r *http.Request, reqType string) {
+	// add defer airbrake notifier
 	gateway.webRequestHandler(gateway.rrh, w, r, reqType)
 }
 
@@ -1057,7 +1062,9 @@ func (gateway *HandleT) webRequestHandler(rh RequestHandler, w http.ResponseWrit
 	var errorMessage string
 	defer func() {
 		if errorMessage != "" {
-			gateway.logger.Infof("IP: %s -- %s -- Response: %d, %s", misc.GetIPFromReq(r), r.URL.Path, response.GetErrorStatusCode(errorMessage), errorMessage)
+			errMsg := fmt.Sprintf("IP: %s -- %s -- Response: %d, %s", misc.GetIPFromReq(r), r.URL.Path, response.GetErrorStatusCode(errorMessage), errorMessage)
+			notifier.Notify(errMsg, nil)
+			gateway.logger.Info(errMsg)
 			http.Error(w, response.GetStatus(errorMessage), response.GetErrorStatusCode(errorMessage))
 			return
 		}
@@ -1311,6 +1318,7 @@ func (gateway *HandleT) StartWebHandler(ctx context.Context) error {
 	gateway.logger.Infof("WebHandler Starting on %d", webPort)
 	component := "gateway"
 	srvMux := chi.NewRouter()
+	airbrakeRouteNotifier := httpbrake.New(notifier)
 	srvMux.Use(
 		chiware.StatMiddleware(ctx, srvMux, stats.Default, component),
 		middleware.LimitConcurrentRequests(maxConcurrentRequests),
@@ -1331,7 +1339,7 @@ func (gateway *HandleT) StartWebHandler(ctx context.Context) error {
 		r.Post("/merge", gateway.webMergeHandler)
 		r.Post("/page", gateway.webPageHandler)
 		r.Post("/screen", gateway.webScreenHandler)
-		r.Post("/track", gateway.webTrackHandler)
+		r.Post("/track", airbrakeRouteNotifier.HandleFunc(gateway.webTrackHandler))
 		r.Post("/webhook", gateway.webhookHandler.RequestHandler)
 
 		r.Get("/webhook", gateway.webhookHandler.RequestHandler)
