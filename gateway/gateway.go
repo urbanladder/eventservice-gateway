@@ -944,7 +944,6 @@ func (gateway *HandleT) webIdentifyHandler(w http.ResponseWriter, r *http.Reques
 }
 
 func (gateway *HandleT) webTrackHandler(w http.ResponseWriter, r *http.Request) {
-	defer notifier.NotifyOnPanic()
 	gateway.webHandler(w, r, "track")
 }
 
@@ -1048,7 +1047,7 @@ func (gateway *HandleT) pixelWebHandler(w http.ResponseWriter, r *http.Request, 
 }
 
 func (gateway *HandleT) webHandler(w http.ResponseWriter, r *http.Request, reqType string) {
-	// add defer airbrake notifier
+	defer notifier.NotifyOnPanic()
 	gateway.webRequestHandler(gateway.rrh, w, r, reqType)
 }
 
